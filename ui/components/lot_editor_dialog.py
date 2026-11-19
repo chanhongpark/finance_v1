@@ -40,7 +40,7 @@ def open_lot_editor_dialog(services: AppServices, manual_lot: Optional[Lot] = No
         symbol_val = manual_lot.symbol
         max_qty = manual_lot.qty
         avg_price_val = manual_lot.avg_price
-        st.info(f"대상 Lot: `{manual_lot.lot_id}` | **{symbol_val}** ({market_val}) | 현재 잔량 {max_qty:,}주 @ {avg_price_val:,.2f}")
+        st.info(f"대상 보유 건: `{manual_lot.lot_id}` | **{symbol_val}** ({market_val}) | 현재 잔량 {max_qty:,}주 @ {avg_price_val:,.2f}")
     else:
         c_m, c_s = st.columns([1, 2])
         market_val = c_m.selectbox("시장", ["KR", "US"], index=0)
@@ -77,7 +77,7 @@ def open_lot_editor_dialog(services: AppServices, manual_lot: Optional[Lot] = No
             max_value=max(1, max_qty),
             value=max_qty if is_mapping else 1,
             step=1,
-            help="기존 보유 수량 일부만 입력하면 나머지 수량은 별도 Lot으로 분할 유지됩니다." if is_mapping else "보유 주식 수량",
+            help="기존 보유 수량 일부만 입력하면 나머지 수량은 별도 보유 건으로 분할 유지됩니다." if is_mapping else "보유 주식 수량",
         )
     )
     price_val = float(
@@ -157,7 +157,7 @@ def open_lot_editor_dialog(services: AppServices, manual_lot: Optional[Lot] = No
                 services.sheet.append_fills(new_fills)
             services.sheet.upsert_lots(updated_lots)
             services.sheet.append_audit(audit)
-            st.success("✅ 기존 보유 Lot에 알고리즘이 연결되었습니다.")
+            st.success("✅ 기존 보유 건에 알고리즘이 연결되었습니다.")
         else:
             lot, fill, audit = register_existing_holding(
                 symbol=symbol_val,
@@ -174,5 +174,5 @@ def open_lot_editor_dialog(services: AppServices, manual_lot: Optional[Lot] = No
             services.sheet.append_fills([fill])
             services.sheet.upsert_lots([lot])
             services.sheet.append_audit(audit)
-            st.success(f"✅ {symbol_val} ({qty_val}주) Lot이 등록되었습니다.")
+            st.success(f"✅ {symbol_val} ({qty_val}주) 보유 건이 등록되었습니다.")
         st.rerun()

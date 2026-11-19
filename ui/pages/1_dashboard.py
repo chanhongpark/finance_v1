@@ -17,7 +17,7 @@ def render_dashboard(services: AppServices) -> None:
 
     # Action bar: Reconcile KIS holdings + Manual holding registration
     b1, b2, _ = st.columns([2, 2, 3])
-    if b1.button("🔄 KIS 보유잔고 불러오기 / 대사", use_container_width=True, help="KIS 실제 잔고와 Sheet 원장을 대조하여 미등록 보유종목을 자동 감지합니다."):
+    if b1.button("🔄 KIS 보유잔고 동기화 (일치 확인)", use_container_width=True, help="KIS 실제 잔고와 Sheet 원장을 대조하여 미등록 보유종목을 자동 감지합니다."):
         report = run_daily_reconciliation(
             services.ctx,
             services.sheet,
@@ -26,7 +26,7 @@ def render_dashboard(services: AppServices) -> None:
             notifier=services.notifier,
         )
         if report.is_matched:
-            st.success("✅ KIS 잔고와 Google Sheet Lots 원장이 100% 일치합니다.")
+            st.success("✅ KIS 잔고와 Google Sheet 보유 원장이 100% 일치합니다.")
         else:
             st.warning(f"⚠️ {len(report.discrepancies)}건의 불일치가 감지되어 처리되었습니다.")
             for d in report.discrepancies:
@@ -52,13 +52,13 @@ def render_dashboard(services: AppServices) -> None:
     total_realized = sum(p.total_realized_pnl for p in perf_map.values())
 
     k1, k2, k3 = st.columns(3)
-    k1.metric("보유 Lot 수", f"{len(open_lots)}개")
+    k1.metric("보유 건수", f"{len(open_lots)}건")
     k2.metric("총 매입원금 (추정)", f"{total_invested:,.0f}")
     k3.metric("누적 실현손익", f"{total_realized:+,.0f}")
 
-    st.subheader("보유 Lot 현황")
+    st.subheader("보유 건 현황")
     if not open_lots:
-        st.info("보유 중인 Lot이 없습니다. 추천 페이지에서 매수하거나 상단 **[➕ 기존 보유종목 수동 등록]** 으로 기존 잔고를 추가해 보세요.")
+        st.info("보유 중인 건이 없습니다. 추천 페이지에서 매수하거나 상단 **[➕ 기존 보유종목 수동 등록]** 으로 기존 잔고를 추가해 보세요.")
     else:
         for lot in open_lots:
             metrics = recalculate_lot_from_fills(lot, fills)
@@ -73,7 +73,7 @@ def render_dashboard(services: AppServices) -> None:
         perf_rows = [
             {
                 "알고리즘": p.algo_id,
-                "전체 Lot": p.total_lots,
+                "전체 운영 건": p.total_lots,
                 "보유 중": p.open_lots,
                 "청산 완료": p.closed_lots,
                 "승률(%)": p.win_rate_pct,

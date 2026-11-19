@@ -56,7 +56,7 @@ def render_recommendations(services: AppServices) -> None:
         if result:
             st.subheader(f"🔴 매도 / 청산 제안 ({len(result['sell'])}건)")
             if not result["sell"]:
-                st.caption("현재 청산 조건에 도달한 보유 Lot이 없습니다.")
+                st.caption("현재 청산 조건에 도달한 보유 건이 없습니다.")
             for idx, sig in enumerate(result["sell"]):
                 render_signal_card(sig, idx, on_order_click=lambda s: open_order_confirmation_dialog(services, s))
 

@@ -10,14 +10,14 @@ from ui.auth import AppServices
 def render_history(services: AppServices) -> None:
     st.title("📒 거래 기록 (원장)")
 
-    t_lots, t_fills, t_signals, t_audit = st.tabs(["Lots (매수건)", "Fills (체결 원장)", "Signals (시그널 근거)", "Audit (감사 로그)"])
+    t_lots, t_fills, t_signals, t_audit = st.tabs(["운영 건 (Lots)", "Fills (체결 원장)", "Signals (시그널 근거)", "Audit (감사 로그)"])
 
     with t_lots:
         lots = services.sheet.load_lots()
         if lots:
             st.dataframe(pd.DataFrame([l.to_sheet_row() for l in lots]), use_container_width=True, hide_index=True)
         else:
-            st.info("기록된 Lot이 없습니다.")
+            st.info("기록된 운영 건이 없습니다.")
 
     with t_fills:
         fills = services.sheet.load_fills()
