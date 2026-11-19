@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# Local runtime cache & secrets (NEVER commit user state or credentials - R1.5)
+/data/
+/logs/
+.env
+.streamlit/secrets.toml
+*.json
+!tests/fixtures/*.json
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
