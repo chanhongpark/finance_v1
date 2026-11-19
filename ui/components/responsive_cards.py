@@ -12,12 +12,15 @@ from core.ledger.models import Lot, LotMetrics
 
 
 def _format_symbol_title(symbol: str, market: str, symbol_name: Optional[str]) -> str:
+    sym = symbol.strip().upper()
+    if market.upper() == "KR" and sym.isdigit() and len(sym) < 6:
+        sym = sym.zfill(6)
     name = (symbol_name or "").strip()
-    if not name or name.upper() == symbol.strip().upper():
-        return symbol
+    if not name or name.upper() == sym:
+        return sym
     if market.upper() == "KR":
-        return f"{name} ({symbol})"
-    return f"{symbol} ({name})"
+        return f"{name} ({sym})"
+    return f"{sym} ({name})"
 
 
 def render_lot_card(

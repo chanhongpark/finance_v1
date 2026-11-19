@@ -84,6 +84,7 @@ class HybridMarketDataProvider:
         self._symbol_names: Dict[Tuple[str, str], str] = {
             ("US", sym): name for sym, name in _COMMON_US_NAMES.items()
         }
+        self._missing_names: set[Tuple[str, str]] = set()
         self._kr_names_loaded: bool = False
 
     def get_krx_listing(self) -> List[Dict[str, Any]]:
@@ -127,41 +128,76 @@ class HybridMarketDataProvider:
             logger.warning("Failed to fetch KRX ETF listing via FinanceDataReader: %s", exc)
             return []
 
+    @staticmethod
+    def _normalize_symbol(symbol: str, market: str) -> str:
+        sym = str(symbol).strip().upper()
+        if market.upper() == "KR" and sym.isdigit() and len(sym) < 6:
+            return sym.zfill(6)
+        return sym
+
+    def _fetch_kr_name_from_naver(self, norm_sym: str) -> str:
+        """Fallback lookup via Naver mobile stock API (works reliably from overseas IPs / Streamlit Cloud)."""
+        try:
+            import requests
+
+            resp = requests.get(
+                f"https://m.stock.naver.com/api/stock/{norm_sym}/basic",
+                timeout=3.0,
+                headers={"User-Agent": "Mozilla/5.0"},
+            )
+            if resp.status_code == 200:
+                data = resp.json()
+                name = str(data.get("stockName", "")).strip()
+                if name:
+                    return name
+        except Exception as exc:
+            logger.debug("Naver stock name lookup failed for %s: %s", norm_sym, exc)
+        return ""
+
     def register_symbol_names(self, market: str, names: Dict[str, str]) -> None:
         """Seed or update in-memory symbol -> name mappings (e.g. from KIS holdings)."""
         mkt = market.upper()
         for sym, name in names.items():
-            s = str(sym).strip().upper()
+            s = self._normalize_symbol(sym, mkt)
             n = str(name).strip()
             if s and n:
                 self._symbol_names[(mkt, s)] = n
+                self._missing_names.discard((mkt, s))
 
     def _ensure_kr_names_loaded(self) -> None:
         if self._kr_names_loaded:
             return
         self._kr_names_loaded = True
         for rec in self.get_krx_listing():
-            self._symbol_names[("KR", str(rec["symbol"]).strip().upper())] = str(rec["name"]).strip()
+            code = self._normalize_symbol(rec["symbol"], "KR")
+            self._symbol_names[("KR", code)] = str(rec["name"]).strip()
         for rec in self.get_krx_etf_listing():
-            self._symbol_names.setdefault(
-                ("KR", str(rec["symbol"]).strip().upper()),
-                str(rec["name"]).strip(),
-            )
+            code = self._normalize_symbol(rec["symbol"], "KR")
+            self._symbol_names.setdefault(("KR", code), str(rec["name"]).strip())
 
     def get_symbol_name(self, symbol: str, market: str = "KR") -> str:
-        """Resolve display name for a KR/US symbol using cached listings & KIS fallback."""
+        """Resolve display name for a KR/US symbol using cached listings + Naver fallback."""
         mkt = market.upper()
-        sym = str(symbol).strip().upper()
+        sym = self._normalize_symbol(symbol, mkt)
         if not sym:
             return ""
         if mkt == "KR":
             self._ensure_kr_names_loaded()
-        return self._symbol_names.get((mkt, sym), "")
+        cached = self._symbol_names.get((mkt, sym))
+        if cached:
+            return cached
+        if mkt == "KR" and (mkt, sym) not in self._missing_names and self._fdr_listing_fn is _default_fdr_listing:
+            naver_name = self._fetch_kr_name_from_naver(sym)
+            if naver_name:
+                self._symbol_names[(mkt, sym)] = naver_name
+                return naver_name
+            self._missing_names.add((mkt, sym))
+        return ""
 
     def format_symbol_display(self, symbol: str, market: str = "KR") -> str:
         """Format symbol with its human-readable name (e.g. '삼성전자 (005930)')."""
         mkt = market.upper()
-        sym = str(symbol).strip().upper()
+        sym = self._normalize_symbol(symbol, mkt)
         name = self.get_symbol_name(sym, mkt)
         if not name or name.upper() == sym:
             return sym
