@@ -180,8 +180,14 @@ def get_app_services() -> AppServices:
         _authenticate_single_user(raw_secrets)
         effective_secrets = raw_secrets
 
-    if "app_services" in st.session_state:
-        return st.session_state["app_services"]
+    cached = st.session_state.get("app_services")
+    if (
+        cached is not None
+        and type(cached.data_provider) is HybridMarketDataProvider
+        and hasattr(cached.data_provider, "get_symbol_name")
+        and hasattr(cached.data_provider, "format_symbol_display")
+    ):
+        return cached
 
     ctx = load_user_context_from_mapping(effective_secrets)
 
