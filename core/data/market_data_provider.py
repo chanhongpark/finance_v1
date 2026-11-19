@@ -312,14 +312,20 @@ class HybridMarketDataProvider:
         """
         if self.kis_client is None:
             return None
-        key = (market.upper(), symbol.upper())
+        mkt = market.upper()
+        norm_sym = self._normalize_symbol(symbol, mkt)
+        key = (mkt, norm_sym)
         now = time.monotonic()
         if key in self._quote_cache:
             ts, cached_quote = self._quote_cache[key]
             if (now - ts) < self.quote_ttl_seconds:
                 return dict(cached_quote)
 
-        quote = self.kis_client.get_current_price(symbol, market=market)
+        try:
+            quote = self.kis_client.get_current_price(norm_sym, market=mkt)
+        except Exception as exc:
+            logger.warning("KIS live quote failed for %s (%s): %s", norm_sym, mkt, exc)
+            quote = None
         if quote:
             self._quote_cache[key] = (now, dict(quote))
         return quote

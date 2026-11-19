@@ -47,25 +47,41 @@ def render_dashboard(services: AppServices) -> None:
             "아래 카드의 **[알고리즘 연결]** 버튼을 눌러 담당 알고리즘과 초기 단계를 설정해 주세요."
         )
 
+    # Fetch live prices for open lots (cached via data_provider TTL)
+    live_prices: dict[tuple[str, str], float] = {}
+    for lot in open_lots:
+        key = (lot.market.upper(), lot.symbol)
+        if key not in live_prices:
+            quote = services.data_provider.get_live_quote(lot.symbol, market=lot.market)
+            price = float(quote.get("price", 0.0) or 0.0) if quote else 0.0
+            live_prices[key] = price
+
     # Top KPI summary
-    total_invested = sum(l.qty * l.avg_price for l in open_lots)
+    lot_metrics_list = [(lot, recalculate_lot_from_fills(lot, fills)) for lot in open_lots]
+    total_invested = sum(m.remaining_qty * m.avg_price for _, m in lot_metrics_list)
+    total_unrealized = sum(
+        ((live_prices.get((lot.market.upper(), lot.symbol), 0.0) or m.avg_price) - m.avg_price) * m.remaining_qty
+        for lot, m in lot_metrics_list
+    )
     perf_map = calculate_algorithm_performance(lots, fills)
     total_realized = sum(p.total_realized_pnl for p in perf_map.values())
 
-    k1, k2, k3 = st.columns(3)
+    k1, k2, k3, k4 = st.columns(4)
     k1.metric("보유 건수", f"{len(open_lots)}건")
     k2.metric("총 매입원금 (추정)", f"{total_invested:,.0f}")
-    k3.metric("누적 실현손익", f"{total_realized:+,.0f}")
+    k3.metric("총 평가손익", f"{total_unrealized:+,.0f}")
+    k4.metric("누적 실현손익", f"{total_realized:+,.0f}")
 
     st.subheader("보유 건 현황")
-    if not open_lots:
+    if not lot_metrics_list:
         st.info("보유 중인 건이 없습니다. 추천 페이지에서 매수하거나 상단 **[➕ 기존 보유종목 수동 등록]** 으로 기존 잔고를 추가해 보세요.")
     else:
-        for lot in open_lots:
-            metrics = recalculate_lot_from_fills(lot, fills)
+        for lot, metrics in lot_metrics_list:
+            curr_price = live_prices.get((lot.market.upper(), lot.symbol), 0.0)
             render_lot_card(
                 lot=lot,
                 metrics=metrics,
+                current_price=curr_price if curr_price > 0 else None,
                 on_map_click=lambda target_lot: open_lot_editor_dialog(services, manual_lot=target_lot),
                 symbol_name=services.data_provider.get_symbol_name(lot.symbol, lot.market),
             )

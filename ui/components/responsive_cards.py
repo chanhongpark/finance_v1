@@ -45,11 +45,17 @@ def render_lot_card(
         else:
             top_r.caption(f"보유 {metrics.holding_days}일")
 
-        m1, m2, m3, m4 = st.columns(4)
+        is_kr = lot.market.upper() == "KR"
+        price_fmt = "{:,.0f}" if is_kr else "{:,.2f}"
+        pnl_fmt = "{:+,.0f}" if is_kr else "{:+,.2f}"
+        has_live = current_price is not None and current_price > 0
+
+        m1, m2, m3, m4, m5 = st.columns(5)
         m1.metric("잔량", f"{metrics.remaining_qty:,}주")
-        m2.metric("평단가", f"{metrics.avg_price:,.2f}")
-        m3.metric("평가손익", f"{unrealized_pnl:+,.0f}", f"{unrealized_pct:+.2f}%")
-        m4.metric("실현손익", f"{metrics.realized_pnl:+,.0f}")
+        m2.metric("평단가", price_fmt.format(metrics.avg_price))
+        m3.metric("현재가", price_fmt.format(eval_price) if has_live else "-")
+        m4.metric("평가손익", pnl_fmt.format(unrealized_pnl), f"{unrealized_pct:+.2f}%")
+        m5.metric("실현손익", pnl_fmt.format(metrics.realized_pnl))
 
 
 def render_signal_card(
