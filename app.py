@@ -9,7 +9,7 @@ from pathlib import Path
 
 import streamlit as st
 
-from ui.auth import get_app_services
+from ui.auth import get_app_services, render_logout_button
 from ui.components.header import render_app_header
 
 st.set_page_config(
@@ -38,6 +38,7 @@ def main() -> None:
         options=["① 대시보드", "② 추천", "③ 거래 기록", "④ 설정"],
         label_visibility="collapsed",
     )
+    render_logout_button()
 
     if page == "① 대시보드":
         _load_page_fn("1_dashboard.py", "render_dashboard")(services)

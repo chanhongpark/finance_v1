@@ -1,12 +1,17 @@
 """
 Streamlit authentication & UserContext session bootstrap (R1.1, R1.2).
-Reads 1-user-1-set config from st.secrets (no shared Registry sheet, no Admin mode).
+Supports both:
+- Multi-user ID/Password login via `[users.<id>]` sections in st.secrets (no Google Cloud Console OAuth needed)
+- Single-user 1-set secrets with optional `APP_PASSWORD` / `ALLOWED_EMAIL` login gate
 """
 from __future__ import annotations
 
+import hashlib
+import hmac
 import os
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import streamlit as st
 
@@ -27,48 +32,158 @@ class AppServices:
     is_offline_demo: bool = False
 
 
+def _to_plain_obj(obj: Any) -> Any:
+    if isinstance(obj, Mapping) or hasattr(obj, "items"):
+        return {k: _to_plain_obj(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_to_plain_obj(v) for v in obj]
+    return obj
+
+
 def _read_secrets_dict() -> Dict[str, Any]:
     merged: Dict[str, Any] = dict(os.environ)
     try:
         for k, v in st.secrets.items():
-            merged[k] = dict(v) if hasattr(v, "items") else v
+            merged[k] = _to_plain_obj(v)
     except Exception:
         pass
     return merged
 
 
-def _check_email_allowlist(ctx: UserContext) -> None:
-    """If ALLOWED_EMAIL is configured in Secrets, verify via st.user / st.login (R1.1)."""
-    allowed = ctx.settings.allowed_email.strip().lower()
-    if not allowed:
+def _verify_password(input_pw: str, expected_pw: str) -> bool:
+    """Verify plaintext or `sha256:<hex>` password in constant time."""
+    if not expected_pw:
+        return True
+    if expected_pw.startswith("sha256:"):
+        expected_hash = expected_pw[7:].strip().lower()
+        actual_hash = hashlib.sha256(input_pw.encode("utf-8")).hexdigest().lower()
+        return hmac.compare_digest(actual_hash, expected_hash)
+    return hmac.compare_digest(input_pw, expected_pw)
+
+
+def _extract_users_map(raw_secrets: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    raw_users = raw_secrets.get("users")
+    if not isinstance(raw_users, Mapping):
+        return {}
+    return {
+        str(k).strip(): dict(v)
+        for k, v in raw_users.items()
+        if str(k).strip() and isinstance(v, Mapping)
+    }
+
+
+def _find_matching_user_key(users: Dict[str, Dict[str, Any]], login_id: str) -> Optional[str]:
+    cleaned = login_id.strip()
+    if not cleaned:
+        return None
+    if cleaned in users:
+        return cleaned
+    lowered = cleaned.lower()
+    for key, cfg in users.items():
+        if key.lower() == lowered:
+            return key
+        allowed_email = str(cfg.get("ALLOWED_EMAIL", cfg.get("email", ""))).strip().lower()
+        if allowed_email and allowed_email == lowered:
+            return key
+    return None
+
+
+def _authenticate_multi_user(raw_secrets: Dict[str, Any], users: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
+    auth_key = st.session_state.get("authenticated_user")
+    if not auth_key or auth_key not in users:
+        st.title("🔐 로그인")
+        st.caption("등록된 사용자 아이디(또는 이메일)와 비밀번호로 접속해 주세요.")
+        with st.form("multi_user_login_form", clear_on_submit=False):
+            login_id = st.text_input("아이디 또는 이메일")
+            password = st.text_input("비밀번호", type="password")
+            submitted = st.form_submit_button("로그인", type="primary", use_container_width=True)
+
+        if submitted:
+            matched_key = _find_matching_user_key(users, login_id)
+            if matched_key is not None:
+                user_cfg = users[matched_key]
+                expected_pw = str(user_cfg.get("password", user_cfg.get("APP_PASSWORD", ""))).strip()
+                if _verify_password(password, expected_pw):
+                    st.session_state["authenticated_user"] = matched_key
+                    st.session_state.pop("app_services", None)
+                    st.rerun()
+            st.error("아이디 또는 비밀번호가 올바르지 않습니다.")
+        st.stop()
+
+    selected = dict(users[auth_key])
+    selected.setdefault("USER_ID", auth_key)
+    # Inherit shared service account if not overridden per user
+    if "gcp_service_account" not in selected and "gcp_service_account" in raw_secrets:
+        selected["gcp_service_account"] = raw_secrets["gcp_service_account"]
+    if "GCP_SERVICE_ACCOUNT_JSON" not in selected and "GCP_SERVICE_ACCOUNT_JSON" in raw_secrets:
+        selected["GCP_SERVICE_ACCOUNT_JSON"] = raw_secrets["GCP_SERVICE_ACCOUNT_JSON"]
+    return selected
+
+
+def _authenticate_single_user(raw_secrets: Dict[str, Any]) -> None:
+    app_password = str(raw_secrets.get("APP_PASSWORD", "")).strip()
+    allowed_email = str(raw_secrets.get("ALLOWED_EMAIL", "")).strip()
+    user_id = str(raw_secrets.get("USER_ID", "default_user")).strip() or "default_user"
+
+    if not app_password and not allowed_email:
         return
 
-    user_obj = getattr(st, "user", None)
-    is_logged_in = bool(getattr(user_obj, "is_logged_in", False)) if user_obj else False
-    if not is_logged_in:
-        st.warning("🔒 허용된 사용자만 접근할 수 있습니다. Google 계정으로 로그인해 주세요.")
-        if hasattr(st, "login"):
-            if st.button("Google 로그인", type="primary"):
-                st.login()
-        st.stop()
+    if st.session_state.get("authenticated_user") == user_id:
+        return
 
-    logged_email = str(getattr(user_obj, "email", "")).strip().lower()
-    if logged_email != allowed:
-        st.error(f"접근 권한이 없는 계정입니다: `{logged_email}`")
-        if hasattr(st, "logout"):
-            if st.button("로그아웃"):
-                st.logout()
-        st.stop()
+    st.title("🔐 로그인")
+    st.caption("허용된 사용자만 접근할 수 있습니다.")
+    with st.form("single_user_login_form", clear_on_submit=False):
+        login_id = ""
+        if allowed_email:
+            login_id = st.text_input("이메일 또는 아이디")
+        password = ""
+        if app_password:
+            password = st.text_input("비밀번호", type="password")
+        else:
+            st.caption("💡 보안을 위해 Secrets에 `APP_PASSWORD`를 함께 설정하는 것을 권장합니다.")
+        submitted = st.form_submit_button("로그인", type="primary", use_container_width=True)
+
+    if submitted:
+        id_ok = True
+        if allowed_email:
+            entered = login_id.strip().lower()
+            id_ok = entered in {allowed_email.lower(), user_id.lower()}
+        pw_ok = _verify_password(password, app_password)
+
+        if id_ok and pw_ok:
+            st.session_state["authenticated_user"] = user_id
+            st.session_state.pop("app_services", None)
+            st.rerun()
+        st.error("로그인 정보가 올바르지 않습니다.")
+    st.stop()
+
+
+def render_logout_button() -> None:
+    """Render a sidebar logout button when session authentication is active."""
+    if st.session_state.get("authenticated_user"):
+        st.sidebar.divider()
+        if st.sidebar.button("🚪 로그아웃", use_container_width=True):
+            st.session_state.pop("authenticated_user", None)
+            st.session_state.pop("app_services", None)
+            st.rerun()
 
 
 def get_app_services() -> AppServices:
     """Initialize and cache per-session AppServices strictly bound to UserContext."""
+    raw_secrets = _read_secrets_dict()
+    users = _extract_users_map(raw_secrets)
+
+    if users:
+        effective_secrets = _authenticate_multi_user(raw_secrets, users)
+    else:
+        _authenticate_single_user(raw_secrets)
+        effective_secrets = raw_secrets
+
     if "app_services" in st.session_state:
         return st.session_state["app_services"]
 
-    raw_secrets = _read_secrets_dict()
-    ctx = load_user_context_from_mapping(raw_secrets)
-    _check_email_allowlist(ctx)
+    ctx = load_user_context_from_mapping(effective_secrets)
 
     offline_demo = False
     if ctx.sheet_id and ctx.credentials.gcp_service_account:
