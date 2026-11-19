@@ -11,11 +11,21 @@ from core.algorithms.base import Signal
 from core.ledger.models import Lot, LotMetrics
 
 
+def _format_symbol_title(symbol: str, market: str, symbol_name: Optional[str]) -> str:
+    name = (symbol_name or "").strip()
+    if not name or name.upper() == symbol.strip().upper():
+        return symbol
+    if market.upper() == "KR":
+        return f"{name} ({symbol})"
+    return f"{symbol} ({name})"
+
+
 def render_lot_card(
     lot: Lot,
     metrics: LotMetrics,
     current_price: Optional[float] = None,
     on_map_click: Optional[Callable[[Lot], None]] = None,
+    symbol_name: Optional[str] = None,
 ) -> None:
     eval_price = current_price if (current_price and current_price > 0) else metrics.avg_price
     unrealized_pnl = (eval_price - metrics.avg_price) * metrics.remaining_qty
@@ -24,7 +34,8 @@ def render_lot_card(
     with st.container(border=True):
         top_l, top_r = st.columns([3, 1])
         algo_badge = "⚠️ 미할당(manual)" if lot.algo_id == "manual" else f"`{lot.algo_id}` v{lot.algo_version}"
-        top_l.markdown(f"**{lot.symbol}** ({lot.market}) · {algo_badge}")
+        symbol_title = _format_symbol_title(lot.symbol, lot.market, symbol_name)
+        top_l.markdown(f"**{symbol_title}** ({lot.market}) · {algo_badge}")
         if lot.algo_id == "manual" and on_map_click is not None:
             if top_r.button("알고리즘 연결", key=f"map_{lot.lot_id}", use_container_width=True):
                 on_map_click(lot)
@@ -42,12 +53,14 @@ def render_signal_card(
     signal: Signal,
     idx: int,
     on_order_click: Callable[[Signal], None],
+    symbol_name: Optional[str] = None,
 ) -> None:
     with st.container(border=True):
         c1, c2 = st.columns([3, 1])
         action_icon = "🟢 매수" if signal.action.value == "BUY" else "🔴 매도"
+        symbol_title = _format_symbol_title(signal.symbol, signal.market.value, symbol_name)
         c1.markdown(
-            f"**{action_icon} {signal.symbol}** ({signal.market.value}) · `{signal.algo_id}` (점수 {signal.score:.0f})"
+            f"**{action_icon} {symbol_title}** ({signal.market.value}) · `{signal.algo_id}` (점수 {signal.score:.0f})"
         )
         if c2.button("주문 확인", key=f"ord_{signal.algo_id}_{signal.symbol}_{idx}", type="primary", use_container_width=True):
             on_order_click(signal)

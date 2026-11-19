@@ -40,7 +40,8 @@ def open_lot_editor_dialog(services: AppServices, manual_lot: Optional[Lot] = No
         symbol_val = manual_lot.symbol
         max_qty = manual_lot.qty
         avg_price_val = manual_lot.avg_price
-        st.info(f"대상 보유 건: `{manual_lot.lot_id}` | **{symbol_val}** ({market_val}) | 현재 잔량 {max_qty:,}주 @ {avg_price_val:,.2f}")
+        symbol_display = services.data_provider.format_symbol_display(symbol_val, market_val)
+        st.info(f"대상 보유 건: `{manual_lot.lot_id}` | **{symbol_display}** ({market_val}) | 현재 잔량 {max_qty:,}주 @ {avg_price_val:,.2f}")
     else:
         c_m, c_s = st.columns([1, 2])
         market_val = c_m.selectbox("시장", ["KR", "US"], index=0)
@@ -174,5 +175,6 @@ def open_lot_editor_dialog(services: AppServices, manual_lot: Optional[Lot] = No
             services.sheet.append_fills([fill])
             services.sheet.upsert_lots([lot])
             services.sheet.append_audit(audit)
-            st.success(f"✅ {symbol_val} ({qty_val}주) 보유 건이 등록되었습니다.")
+            symbol_display = services.data_provider.format_symbol_display(symbol_val, market_val)
+            st.success(f"✅ {symbol_display} ({qty_val}주) 보유 건이 등록되었습니다.")
         st.rerun()

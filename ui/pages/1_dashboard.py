@@ -30,7 +30,8 @@ def render_dashboard(services: AppServices) -> None:
         else:
             st.warning(f"⚠️ {len(report.discrepancies)}건의 불일치가 감지되어 처리되었습니다.")
             for d in report.discrepancies:
-                st.write(f"- **{d.symbol}** ({d.market}): KIS {d.kis_qty}주 vs Sheet {d.sheet_qty}주 → {d.action_taken}")
+                sym_disp = services.data_provider.format_symbol_display(d.symbol, d.market)
+                st.write(f"- **{sym_disp}** ({d.market}): KIS {d.kis_qty}주 vs Sheet {d.sheet_qty}주 → {d.action_taken}")
 
     if b2.button("➕ 기존 보유종목 수동 등록", use_container_width=True, help="매수 히스토리가 없는 기존 보유 종목을 원장에 직접 등록합니다."):
         open_lot_editor_dialog(services, manual_lot=None)
@@ -66,6 +67,7 @@ def render_dashboard(services: AppServices) -> None:
                 lot=lot,
                 metrics=metrics,
                 on_map_click=lambda target_lot: open_lot_editor_dialog(services, manual_lot=target_lot),
+                symbol_name=services.data_provider.get_symbol_name(lot.symbol, lot.market),
             )
 
     st.subheader("알고리즘별 성과 비교")

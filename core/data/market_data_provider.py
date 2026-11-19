@@ -35,6 +35,30 @@ def _default_fdr_listing(market: str) -> pd.DataFrame:
     return fdr.StockListing(market)
 
 
+_COMMON_US_NAMES: Dict[str, str] = {
+    "TQQQ": "ProShares UltraPro QQQ",
+    "SOXL": "Direxion Daily Semiconductor Bull 3X",
+    "SQQQ": "ProShares UltraPro Short QQQ",
+    "SOXS": "Direxion Daily Semiconductor Bear 3X",
+    "UPRO": "ProShares UltraPro S&P500",
+    "TMF": "Direxion Daily 20+ Yr Treasury Bull 3X",
+    "QLD": "ProShares Ultra QQQ",
+    "SSO": "ProShares Ultra S&P500",
+    "QQQ": "Invesco QQQ Trust",
+    "SPY": "SPDR S&P 500 ETF",
+    "VOO": "Vanguard S&P 500 ETF",
+    "VTI": "Vanguard Total Stock Market ETF",
+    "SCHD": "Schwab US Dividend Equity ETF",
+    "AAPL": "Apple",
+    "MSFT": "Microsoft",
+    "NVDA": "NVIDIA",
+    "TSLA": "Tesla",
+    "AMZN": "Amazon",
+    "GOOGL": "Alphabet",
+    "META": "Meta Platforms",
+}
+
+
 class HybridMarketDataProvider:
     """
     Minimizes KIS API usage by serving historical OHLCV & listings from
@@ -57,6 +81,10 @@ class HybridMarketDataProvider:
         self.quote_ttl_seconds = quote_ttl_seconds
         self.max_workers = max_workers
         self._quote_cache: Dict[Tuple[str, str], Tuple[float, Dict[str, Any]]] = {}
+        self._symbol_names: Dict[Tuple[str, str], str] = {
+            ("US", sym): name for sym, name in _COMMON_US_NAMES.items()
+        }
+        self._kr_names_loaded: bool = False
 
     def get_krx_listing(self) -> List[Dict[str, Any]]:
         """Return cached KRX symbol listing (0 KIS API calls)."""
@@ -78,6 +106,68 @@ class HybridMarketDataProvider:
         except Exception as exc:
             logger.warning("Failed to fetch KRX listing via FinanceDataReader: %s", exc)
             return []
+
+    def get_krx_etf_listing(self) -> List[Dict[str, Any]]:
+        """Return cached KRX ETF listing (0 KIS API calls)."""
+        cached = self.cache.load_listing("KRX_ETF")
+        if cached is not None:
+            return cached
+        try:
+            df = self._fdr_listing_fn("ETF/KR")
+            records: List[Dict[str, Any]] = []
+            for _, row in df.iterrows():
+                code = str(row.get("Symbol", row.get("Code", ""))).strip()
+                name = str(row.get("Name", "")).strip()
+                if code and name:
+                    records.append({"symbol": code, "name": name, "market_group": "ETF"})
+            if records:
+                self.cache.save_listing(records, "KRX_ETF")
+            return records
+        except Exception as exc:
+            logger.warning("Failed to fetch KRX ETF listing via FinanceDataReader: %s", exc)
+            return []
+
+    def register_symbol_names(self, market: str, names: Dict[str, str]) -> None:
+        """Seed or update in-memory symbol -> name mappings (e.g. from KIS holdings)."""
+        mkt = market.upper()
+        for sym, name in names.items():
+            s = str(sym).strip().upper()
+            n = str(name).strip()
+            if s and n:
+                self._symbol_names[(mkt, s)] = n
+
+    def _ensure_kr_names_loaded(self) -> None:
+        if self._kr_names_loaded:
+            return
+        self._kr_names_loaded = True
+        for rec in self.get_krx_listing():
+            self._symbol_names[("KR", str(rec["symbol"]).strip().upper())] = str(rec["name"]).strip()
+        for rec in self.get_krx_etf_listing():
+            self._symbol_names.setdefault(
+                ("KR", str(rec["symbol"]).strip().upper()),
+                str(rec["name"]).strip(),
+            )
+
+    def get_symbol_name(self, symbol: str, market: str = "KR") -> str:
+        """Resolve display name for a KR/US symbol using cached listings & KIS fallback."""
+        mkt = market.upper()
+        sym = str(symbol).strip().upper()
+        if not sym:
+            return ""
+        if mkt == "KR":
+            self._ensure_kr_names_loaded()
+        return self._symbol_names.get((mkt, sym), "")
+
+    def format_symbol_display(self, symbol: str, market: str = "KR") -> str:
+        """Format symbol with its human-readable name (e.g. '삼성전자 (005930)')."""
+        mkt = market.upper()
+        sym = str(symbol).strip().upper()
+        name = self.get_symbol_name(sym, mkt)
+        if not name or name.upper() == sym:
+            return sym
+        if mkt == "KR":
+            return f"{name} ({sym})"
+        return f"{sym} ({name})"
 
     def get_daily_ohlcv(
         self,

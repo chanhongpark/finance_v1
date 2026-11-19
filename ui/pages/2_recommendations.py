@@ -58,13 +58,23 @@ def render_recommendations(services: AppServices) -> None:
             if not result["sell"]:
                 st.caption("현재 청산 조건에 도달한 보유 건이 없습니다.")
             for idx, sig in enumerate(result["sell"]):
-                render_signal_card(sig, idx, on_order_click=lambda s: open_order_confirmation_dialog(services, s))
+                render_signal_card(
+                    sig,
+                    idx,
+                    on_order_click=lambda s: open_order_confirmation_dialog(services, s),
+                    symbol_name=services.data_provider.get_symbol_name(sig.symbol, sig.market.value),
+                )
 
             st.subheader(f"🟢 신규 / 추가 매수 제안 ({len(result['buy'])}건)")
             if not result["buy"]:
                 st.caption("현재 진입 조건을 충족한 종목이 없습니다.")
             for idx, sig in enumerate(result["buy"]):
-                render_signal_card(sig, idx + 1000, on_order_click=lambda s: open_order_confirmation_dialog(services, s))
+                render_signal_card(
+                    sig,
+                    idx + 1000,
+                    on_order_click=lambda s: open_order_confirmation_dialog(services, s),
+                    symbol_name=services.data_provider.get_symbol_name(sig.symbol, sig.market.value),
+                )
 
     with tab_us:
         us_algo = default_registry.require("us_infinite_buying")
@@ -93,4 +103,9 @@ def render_recommendations(services: AppServices) -> None:
             st.session_state["us_preview_signals"] = us_signals
 
         for idx, sig in enumerate(st.session_state.get("us_preview_signals", [])):
-            render_signal_card(sig, idx + 2000, on_order_click=lambda s: open_order_confirmation_dialog(services, s))
+            render_signal_card(
+                sig,
+                idx + 2000,
+                on_order_click=lambda s: open_order_confirmation_dialog(services, s),
+                symbol_name=services.data_provider.get_symbol_name(sig.symbol, sig.market.value),
+            )

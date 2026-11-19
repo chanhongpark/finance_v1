@@ -17,8 +17,9 @@ def open_order_confirmation_dialog(services: AppServices, signal: Signal) -> Non
     st.markdown(f"**계좌 모드:** {mode_text}")
     st.divider()
 
+    symbol_display = services.data_provider.format_symbol_display(signal.symbol, signal.market.value)
     col1, col2 = st.columns(2)
-    col1.metric("종목", f"{signal.symbol} ({signal.market.value})")
+    col1.metric("종목", f"{symbol_display} ({signal.market.value})")
     col2.metric("매매 구분", signal.action.value)
 
     col3, col4 = st.columns(2)
