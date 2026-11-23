@@ -23,6 +23,27 @@ logger = logging.getLogger(__name__)
 KIS_REAL_BASE = "https://openapi.koreainvestment.com:9443"
 KIS_MOCK_BASE = "https://openapivts.koreainvestment.com:29443"
 
+# KIS domestic ORD_DVSN codes keyed by PriceType value.
+KR_ORD_DVSN: Dict[str, str] = {
+    "지정가": "00",
+    "시장가": "01",
+    "조건부지정가": "02",
+    "최유리지정가": "03",
+    "최우선지정가": "04",
+}
+KR_PRICED_ORD_DVSN = {"00", "02"}
+
+# KIS overseas (US) ORD_DVSN codes keyed by (side, PriceType value).
+US_ORD_DVSN: Dict[tuple, str] = {
+    ("BUY", "지정가"): "00",
+    ("BUY", "LOO"): "32",
+    ("BUY", "LOC"): "34",
+    ("SELL", "지정가"): "00",
+    ("SELL", "MOO"): "31",
+    ("SELL", "LOO"): "32",
+    ("SELL", "MOC"): "33",
+    ("SELL", "LOC"): "34",
+}
 
 class KISClient:
     """Per-user KIS API client with isolated token cache in data/<user_id>/kis_token.json."""
@@ -234,14 +255,17 @@ class KISClient:
                 tr_id = "VTTC0802U" if self.ctx.is_mock else "TTTC0802U"
             else:
                 tr_id = "VTTC0801U" if self.ctx.is_mock else "TTTC0801U"
-            ord_dvsn = "01" if price_type == "시장가" else "00"
+            ord_dvsn = KR_ORD_DVSN.get(price_type)
+            if ord_dvsn is None:
+                return {"success": False, "order_no": "", "message": f"국내 주식에서 지원하지 않는 주문유형: {price_type}"}
+            send_price = ord_dvsn in KR_PRICED_ORD_DVSN
             body = {
                 "CANO": self.ctx.credentials.account_prefix,
                 "ACNT_PRDT_CD": self.ctx.credentials.account_suffix,
                 "PDNO": symbol,
                 "ORD_DVSN": ord_dvsn,
                 "ORD_QTY": str(int(qty)),
-                "ORD_UNPR": "0" if ord_dvsn == "01" else str(int(round(price))),
+                "ORD_UNPR": str(int(round(price))) if send_price else "0",
             }
             url = f"{self.base_url}/uapi/domestic-stock/v1/trading/order-cash"
             resp = requests.post(url, headers=self._headers(tr_id), json=body, timeout=self.timeout)
@@ -258,7 +282,11 @@ class KISClient:
             tr_id = "VTTT1002U" if self.ctx.is_mock else "TTTT1002U"
         else:
             tr_id = "VTTT1006U" if self.ctx.is_mock else "TTTT1006U"
-        ord_dvsn = "34" if price_type == "LOC" else "00"
+        ord_dvsn = US_ORD_DVSN.get((side_u, price_type))
+        if ord_dvsn is None:
+            return {"success": False, "order_no": "", "message": f"미국 주식 {side_u}에서 지원하지 않는 주문유형: {price_type}"}
+        if ord_dvsn in {"31", "33"}:  # MOO / MOC: price is broker-determined
+            price = 0.0
         body = {
             "CANO": self.ctx.credentials.account_prefix,
             "ACNT_PRDT_CD": self.ctx.credentials.account_suffix,

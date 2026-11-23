@@ -27,6 +27,41 @@ class PriceType(str, Enum):
     LIMIT = "지정가"
     MARKET = "시장가"
     LOC = "LOC"
+    # KR-only order types
+    CONDITIONAL_LIMIT = "조건부지정가"
+    BEST_LIMIT = "최유리지정가"
+    PRIORITY_LIMIT = "최우선지정가"
+    # US-only order types
+    LOO = "LOO"
+    MOO = "MOO"
+    MOC = "MOC"
+
+    @property
+    def requires_price(self) -> bool:
+        """Whether the user-specified unit price is sent to the broker (False => price is broker-determined)."""
+        return self in {PriceType.LIMIT, PriceType.LOC, PriceType.CONDITIONAL_LIMIT, PriceType.LOO}
+
+
+# Order types supported per (market, side) by KIS Open API.
+# KR: ORD_DVSN 00/01/02/03/04, US: ORD_DVSN 00/32/34 (BUY), 00/31/32/33/34 (SELL).
+SUPPORTED_PRICE_TYPES: Dict[tuple, List[PriceType]] = {
+    ("KR", "BUY"): [PriceType.LIMIT, PriceType.MARKET, PriceType.CONDITIONAL_LIMIT, PriceType.BEST_LIMIT, PriceType.PRIORITY_LIMIT],
+    ("KR", "SELL"): [PriceType.LIMIT, PriceType.MARKET, PriceType.CONDITIONAL_LIMIT, PriceType.BEST_LIMIT, PriceType.PRIORITY_LIMIT],
+    ("US", "BUY"): [PriceType.LIMIT, PriceType.LOC, PriceType.LOO],
+    ("US", "SELL"): [PriceType.LIMIT, PriceType.LOC, PriceType.LOO, PriceType.MOC, PriceType.MOO],
+}
+
+PRICE_TYPE_HELP: Dict[PriceType, str] = {
+    PriceType.LIMIT: "지정한 가격 이하(매수)/이상(매도)에서만 체결",
+    PriceType.MARKET: "가격 지정 없이 즉시 체결 (가격은 참고용 추정치)",
+    PriceType.LOC: "Limit-On-Close: 종가가 지정가 이하(매수)/이상(매도)일 때 종가로 체결",
+    PriceType.CONDITIONAL_LIMIT: "장중 지정가로 주문, 미체결 시 장 마감 동시호가에 시장가로 전환",
+    PriceType.BEST_LIMIT: "주문 시점 상대 호가의 최우선 가격으로 지정가 주문",
+    PriceType.PRIORITY_LIMIT: "주문 시점 자기 방향 호가의 최우선 가격으로 지정가 주문",
+    PriceType.LOO: "Limit-On-Open: 시가가 지정가 조건을 충족하면 시가로 체결",
+    PriceType.MOO: "Market-On-Open: 장 시작 시가로 체결 (매도 전용)",
+    PriceType.MOC: "Market-On-Close: 장 마감 종가로 체결 (매도 전용)",
+}
 
 
 @dataclass(frozen=True)

@@ -17,7 +17,7 @@ def render_dashboard(services: AppServices) -> None:
 
     # Action bar: Reconcile KIS holdings + Manual holding registration
     b1, b2, _ = st.columns([2, 2, 3])
-    if b1.button("🔄 KIS 보유잔고 동기화 (일치 확인)", use_container_width=True, help="KIS 실제 잔고와 Sheet 원장을 대조하여 미등록 보유종목을 자동 감지합니다."):
+    if b1.button("🔄 KIS 보유잔고 동기화 (일치 확인)", width="stretch", help="KIS 실제 잔고와 Sheet 원장을 대조하여 미등록 보유종목을 자동 감지합니다."):
         report = run_daily_reconciliation(
             services.ctx,
             services.sheet,
@@ -33,7 +33,7 @@ def render_dashboard(services: AppServices) -> None:
                 sym_disp = services.data_provider.format_symbol_display(d.symbol, d.market)
                 st.write(f"- **{sym_disp}** ({d.market}): KIS {d.kis_qty}주 vs Sheet {d.sheet_qty}주 → {d.action_taken}")
 
-    if b2.button("➕ 기존 보유종목 수동 등록", use_container_width=True, help="매수 히스토리가 없는 기존 보유 종목을 원장에 직접 등록합니다."):
+    if b2.button("➕ 기존 보유종목 수동 등록", width="stretch", help="매수 히스토리가 없는 기존 보유 종목을 원장에 직접 등록합니다."):
         open_lot_editor_dialog(services, manual_lot=None)
 
     lots = services.sheet.load_lots()
@@ -56,25 +56,59 @@ def render_dashboard(services: AppServices) -> None:
             price = float(quote.get("price", 0.0) or 0.0) if quote else 0.0
             live_prices[key] = price
 
-    # Top KPI summary
+    # Overall summary (counts only — KRW/USD amounts are never summed together)
+    kr_open = [l for l in open_lots if l.market.upper() == "KR"]
+    us_open = [l for l in open_lots if l.market.upper() == "US"]
+    s1, s2, s3 = st.columns(3)
+    s1.metric("전체 보유 건수", f"{len(open_lots)}건")
+    s2.metric("🇰🇷 한국 주식", f"{len(kr_open)}건")
+    s3.metric("🇺🇸 미국 주식", f"{len(us_open)}건")
+
+    tab_kr, tab_us = st.tabs([f"🇰🇷 한국 주식 ({len(kr_open)})", f"🇺🇸 미국 주식 ({len(us_open)})"])
+    with tab_kr:
+        _render_market_section(services, "KR", lots, fills, kr_open, live_prices)
+    with tab_us:
+        _render_market_section(services, "US", lots, fills, us_open, live_prices)
+
+
+def _render_market_section(
+    services: AppServices,
+    market: str,
+    all_lots: list,
+    fills: list,
+    open_lots: list,
+    live_prices: dict[tuple[str, str], float],
+) -> None:
+    is_kr = market == "KR"
+    unit = "원" if is_kr else "USD"
+    amt_fmt = "{:,.0f}" if is_kr else "{:,.2f}"
+    pnl_fmt = "{:+,.0f}" if is_kr else "{:+,.2f}"
+
     lot_metrics_list = [(lot, recalculate_lot_from_fills(lot, fills)) for lot in open_lots]
     total_invested = sum(m.remaining_qty * m.avg_price for _, m in lot_metrics_list)
-    total_unrealized = sum(
-        ((live_prices.get((lot.market.upper(), lot.symbol), 0.0) or m.avg_price) - m.avg_price) * m.remaining_qty
+    total_eval = sum(
+        (live_prices.get((lot.market.upper(), lot.symbol), 0.0) or m.avg_price) * m.remaining_qty
         for lot, m in lot_metrics_list
     )
-    perf_map = calculate_algorithm_performance(lots, fills)
+    total_unrealized = total_eval - total_invested
+    unrealized_pct = (total_unrealized / total_invested * 100.0) if total_invested > 0 else 0.0
+
+    market_lots = [l for l in all_lots if l.market.upper() == market]
+    perf_map = calculate_algorithm_performance(market_lots, fills)
     total_realized = sum(p.total_realized_pnl for p in perf_map.values())
 
     k1, k2, k3, k4 = st.columns(4)
     k1.metric("보유 건수", f"{len(open_lots)}건")
-    k2.metric("총 매입원금 (추정)", f"{total_invested:,.0f}")
-    k3.metric("총 평가손익", f"{total_unrealized:+,.0f}")
-    k4.metric("누적 실현손익", f"{total_realized:+,.0f}")
+    k2.metric(f"총 매입원금 ({unit})", amt_fmt.format(total_invested))
+    k3.metric(f"총 평가손익 ({unit})", pnl_fmt.format(total_unrealized), f"{unrealized_pct:+.2f}%")
+    k4.metric(f"누적 실현손익 ({unit})", pnl_fmt.format(total_realized))
 
     st.subheader("보유 건 현황")
     if not lot_metrics_list:
-        st.info("보유 중인 건이 없습니다. 추천 페이지에서 매수하거나 상단 **[➕ 기존 보유종목 수동 등록]** 으로 기존 잔고를 추가해 보세요.")
+        st.info(
+            f"보유 중인 {'한국' if is_kr else '미국'} 주식이 없습니다. "
+            "추천 페이지에서 매수하거나 상단 **[➕ 기존 보유종목 수동 등록]** 으로 기존 잔고를 추가해 보세요."
+        )
     else:
         for lot, metrics in lot_metrics_list:
             curr_price = live_prices.get((lot.market.upper(), lot.symbol), 0.0)
@@ -96,12 +130,12 @@ def render_dashboard(services: AppServices) -> None:
                 "청산 완료": p.closed_lots,
                 "승률(%)": p.win_rate_pct,
                 "평균 수익률(%)": p.avg_return_pct,
-                "실현손익": p.total_realized_pnl,
+                f"실현손익({unit})": p.total_realized_pnl,
                 "평균 보유일": p.avg_holding_days,
                 "MDD(%)": p.max_drawdown_pct,
             }
             for p in perf_map.values()
         ]
-        st.dataframe(pd.DataFrame(perf_rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(perf_rows), hide_index=True)
     else:
         st.caption("아직 집계된 알고리즘 거래 이력이 없습니다.")
