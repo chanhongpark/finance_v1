@@ -20,10 +20,12 @@ from plotly.subplots import make_subplots
 
 from core.algorithms.base import PRICE_TYPE_HELP, SUPPORTED_PRICE_TYPES, PriceType, Signal, SignalAction
 from core.execution.order_service import OrderService
+from core.indicators import calculate_technical_indicators
 from ui.auth import AppServices
 
 CHART_LOOKBACK_DAYS = 200
 CHART_BARS = 120
+FUJIMOTO_ALGO_IDS = {"kr_fujimoto_126", "us_fujimoto_126"}
 
 
 def kr_tick_size(price: float) -> int:
@@ -61,14 +63,68 @@ def _build_price_chart(
     order_price: Optional[float],
     avg_price: Optional[float],
 ) -> go.Figure:
-    data = df.copy()
-    data["date"] = pd.to_datetime(data["date"].astype(str).str[:10], errors="coerce")
-    data = data.dropna(subset=["date"]).sort_values("date")
-    data["ma20"] = data["close"].rolling(20).mean()
-    data["ma60"] = data["close"].rolling(60).mean()
+    show_fujimoto = signal.algo_id in FUJIMOTO_ALGO_IDS
+    ind_df = calculate_technical_indicators(df, min_bars=5) if show_fujimoto else None
+    if ind_df is not None and not ind_df.empty:
+        data = ind_df.copy()
+        data["date"] = pd.to_datetime(data["date"].astype(str).str[:10], errors="coerce")
+        data = data.dropna(subset=["date"]).sort_values("date")
+    else:
+        show_fujimoto = False
+        data = df.copy()
+        data["date"] = pd.to_datetime(data["date"].astype(str).str[:10], errors="coerce")
+        data = data.dropna(subset=["date"]).sort_values("date")
+        data["ma20"] = data["close"].rolling(20).mean()
+        data["ma60"] = data["close"].rolling(60).mean()
+
     data = data.tail(CHART_BARS)
 
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.78, 0.22], vertical_spacing=0.03)
+    if show_fujimoto:
+        fig = make_subplots(
+            rows=3,
+            cols=1,
+            shared_xaxes=True,
+            row_heights=[0.56, 0.16, 0.28],
+            vertical_spacing=0.03,
+        )
+    else:
+        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.78, 0.22], vertical_spacing=0.03)
+
+    if show_fujimoto:
+        # Shaded Ichimoku Cloud behind candlesticks
+        fig.add_trace(
+            go.Scatter(
+                x=data["date"],
+                y=data["cloud_top"],
+                name="구름상단",
+                line=dict(color="rgba(59, 130, 246, 0.55)", width=1.0, dash="dot"),
+            ),
+            row=1,
+            col=1,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=data["date"],
+                y=data["cloud_bottom"],
+                name="구름하단",
+                line=dict(color="rgba(239, 68, 68, 0.55)", width=1.0, dash="dot"),
+                fill="tonexty",
+                fillcolor="rgba(148, 163, 184, 0.22)",
+            ),
+            row=1,
+            col=1,
+        )
+        fig.add_trace(
+            go.Scatter(
+                x=data["date"],
+                y=data["tenkan_sen"],
+                name="전환선",
+                line=dict(color="#14b8a6", width=1.1, dash="dash"),
+            ),
+            row=1,
+            col=1,
+        )
+
     fig.add_trace(
         go.Candlestick(
             x=data["date"],
@@ -92,6 +148,26 @@ def _build_price_chart(
     vol_colors = ["#d6334c" if c >= o else "#2f6fdb" for o, c in zip(data["open"], data["close"])]
     fig.add_trace(go.Bar(x=data["date"], y=data["volume"], name="거래량", marker_color=vol_colors, opacity=0.6, showlegend=False), row=2, col=1)
 
+    if show_fujimoto:
+        hist_colors = ["#d6334c" if v >= 0 else "#2f6fdb" for v in data["macd_hist"]]
+        fig.add_trace(
+            go.Bar(x=data["date"], y=data["macd_hist"], name="MACD Hist", marker_color=hist_colors, opacity=0.65),
+            row=3,
+            col=1,
+        )
+        fig.add_trace(
+            go.Scatter(x=data["date"], y=data["macd_line"], name="MACD", line=dict(color="#e8a33d", width=1.5)),
+            row=3,
+            col=1,
+        )
+        fig.add_trace(
+            go.Scatter(x=data["date"], y=data["macd_signal"], name="Signal", line=dict(color="#8a63d2", width=1.4)),
+            row=3,
+            col=1,
+        )
+        fig.add_hline(y=0.0, line=dict(color="#9ca3af", width=1.0, dash="dot"), row=3, col=1)
+        fig.update_yaxes(title_text="MACD", row=3, col=1)
+
     def _hline(y: Optional[float], label: str, color: str, dash: str) -> None:
         if y is None or not (isinstance(y, (int, float)) and y > 0 and math.isfinite(y)):
             return
@@ -113,7 +189,7 @@ def _build_price_chart(
     _hline(meta.get("stop_loss_price"), "손절가", "#d6334c", "dash")
 
     fig.update_layout(
-        height=420,
+        height=560 if show_fujimoto else 420,
         margin=dict(l=8, r=8, t=24, b=8),
         xaxis_rangeslider_visible=False,
         legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="right", x=1),
@@ -126,7 +202,12 @@ def _build_price_chart(
 
 def _render_evidence_chart(services: AppServices, signal: Signal, order_price: Optional[float]) -> None:
     try:
-        df = services.data_provider.get_daily_ohlcv(signal.symbol, market=signal.market.value, lookback_days=CHART_LOOKBACK_DAYS)
+        df = services.data_provider.get_daily_ohlcv(
+            signal.symbol,
+            market=signal.market.value,
+            lookback_days=CHART_LOOKBACK_DAYS,
+            include_live_quote=True,
+        )
     except Exception as exc:  # chart is evidence only; never block the order flow
         st.caption(f"차트 데이터를 불러오지 못했습니다: {exc}")
         return
