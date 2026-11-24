@@ -9,10 +9,31 @@ from core.ledger.calculator import calculate_algorithm_performance, recalculate_
 from core.ledger.models import LotStatus
 from ui.auth import AppServices
 from ui.components.lot_editor_dialog import open_lot_editor_dialog
-from ui.components.responsive_cards import render_lot_card
+from ui.components.responsive_cards import compute_lot_guidance, render_lot_card
+
+
+_DASHBOARD_COMPACT_CSS = """
+<style>
+[data-testid="stMetric"] {
+    padding: 0.1rem 0 !important;
+}
+[data-testid="stMetricLabel"] p {
+    font-size: 0.76rem !important;
+    margin-bottom: 0.05rem !important;
+}
+[data-testid="stMetricValue"] {
+    font-size: 1.15rem !important;
+    line-height: 1.25 !important;
+}
+[data-testid="stMetricDelta"] {
+    font-size: 0.74rem !important;
+}
+</style>
+"""
 
 
 def render_dashboard(services: AppServices) -> None:
+    st.markdown(_DASHBOARD_COMPACT_CSS, unsafe_allow_html=True)
     st.title("📊 대시보드")
 
     # Action bar: Reconcile KIS holdings + Manual holding registration
@@ -38,6 +59,8 @@ def render_dashboard(services: AppServices) -> None:
 
     lots = services.sheet.load_lots()
     fills = services.sheet.load_fills()
+    algo_configs = services.sheet.load_algorithm_configs()
+    user_settings = services.sheet.load_user_settings()
     open_lots = [l for l in lots if l.status == LotStatus.OPEN and l.qty > 0]
     manual_lots = [l for l in open_lots if l.algo_id == "manual"]
 
@@ -66,9 +89,9 @@ def render_dashboard(services: AppServices) -> None:
 
     tab_kr, tab_us = st.tabs([f"🇰🇷 한국 주식 ({len(kr_open)})", f"🇺🇸 미국 주식 ({len(us_open)})"])
     with tab_kr:
-        _render_market_section(services, "KR", lots, fills, kr_open, live_prices)
+        _render_market_section(services, "KR", lots, fills, kr_open, live_prices, algo_configs, user_settings.global_hard_stop_loss_pct)
     with tab_us:
-        _render_market_section(services, "US", lots, fills, us_open, live_prices)
+        _render_market_section(services, "US", lots, fills, us_open, live_prices, algo_configs, user_settings.global_hard_stop_loss_pct)
 
 
 def _render_market_section(
@@ -78,6 +101,8 @@ def _render_market_section(
     fills: list,
     open_lots: list,
     live_prices: dict[tuple[str, str], float],
+    algo_configs: dict,
+    global_hard_stop_loss_pct: float,
 ) -> None:
     is_kr = market == "KR"
     unit = "원" if is_kr else "USD"
@@ -112,12 +137,22 @@ def _render_market_section(
     else:
         for lot, metrics in lot_metrics_list:
             curr_price = live_prices.get((lot.market.upper(), lot.symbol), 0.0)
+            cached_df = services.data_provider.cache.load_ohlcv(lot.market, lot.symbol)
+            guidance = compute_lot_guidance(
+                lot=lot,
+                avg_price=metrics.avg_price,
+                current_price=curr_price if curr_price > 0 else None,
+                algo_configs=algo_configs,
+                global_hard_stop_loss_pct=global_hard_stop_loss_pct,
+                cached_df=cached_df,
+            )
             render_lot_card(
                 lot=lot,
                 metrics=metrics,
                 current_price=curr_price if curr_price > 0 else None,
                 on_map_click=lambda target_lot: open_lot_editor_dialog(services, manual_lot=target_lot),
                 symbol_name=services.data_provider.get_symbol_name(lot.symbol, lot.market),
+                guidance_items=guidance,
             )
 
     st.subheader("알고리즘별 성과 비교")
