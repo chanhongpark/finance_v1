@@ -92,8 +92,27 @@ class KRFujimoto126Algorithm(Algorithm):
 
         # Stage 1 (1/9): RSI oversold bounce
         if curr_entry_stage == 0:
-            rsi_bounce = (prev_rsi <= rsi_th and curr_rsi > rsi_th) or (curr_rsi <= rsi_th + 2.0 and curr_rsi > prev_rsi)
-            cond = Condition("RSI(14) 과매도 반등", round(curr_rsi, 1), rsi_th, "<=", rsi_bounce, "RSI 30 부근 반등 탐색 진입")
+            crossed_up = (prev_rsi <= rsi_th) and (curr_rsi > rsi_th)
+            near_bounce = (curr_rsi <= rsi_th + 2.0) and (curr_rsi > prev_rsi)
+            rsi_bounce = crossed_up or near_bounce
+            if crossed_up:
+                cond = Condition(
+                    "RSI(14) 과매도 돌파",
+                    f"{prev_rsi:.1f}→{curr_rsi:.1f}",
+                    rsi_th,
+                    ">",
+                    True,
+                    f"전일 RSI({prev_rsi:.1f}) <= {rsi_th:.0f} 후 상향 반등",
+                )
+            else:
+                cond = Condition(
+                    "RSI(14) 과매도 반등",
+                    f"{prev_rsi:.1f}→{curr_rsi:.1f}",
+                    round(rsi_th + 2.0, 1),
+                    "<=",
+                    rsi_bounce,
+                    f"RSI {rsi_th:.0f} 부근({rsi_th + 2.0:.0f} 이하) 상승 전환",
+                )
             if not rsi_bounce:
                 return None
             qty = max(1, int((unit_budget * 1.0) // curr_price)) if (unit_budget * 1.0) >= curr_price else 1
