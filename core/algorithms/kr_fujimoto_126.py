@@ -41,12 +41,23 @@ class KRFujimoto126Algorithm(Algorithm):
         "분할 매수하고, 역방향 1:2:6(RSI 과열이탈 → MACD 데드크로스 → 구름대 하단이탈)으로 분할 청산합니다."
     )
     market = Market.KR
+    _budget_param_key: str = "total_budget_krw"
+    _price_decimals: int = 0
+    _currency_symbol: str = "원"
     params_schema = [
         ParamSpec("total_budget_krw", "종목당 총 9유닛 예산(원)", "float", 1_800_000.0, "1:2:6 전체(9유닛) 합산 예산", 90_000.0, 50_000_000.0, 90_000.0),
         ParamSpec("rsi_oversold", "1단계 RSI 과매도 기준", "float", 30.0, "1단계 매수 RSI 기준선", 15.0, 45.0, 1.0),
         ParamSpec("rsi_overbought", "1차 청산 RSI 과열 기준", "float", 70.0, "1차 청산 RSI 과열 기준선", 60.0, 85.0, 1.0),
         ParamSpec("stop_loss_rate", "비상 손절률", "float", -0.05, "비상 손절 기준 수익률 (-0.05 = -5%)", -0.20, -0.01, 0.005),
     ]
+
+    def _round_price(self, price: float) -> float:
+        return round(price, self._price_decimals)
+
+    def _fmt_price(self, price: float) -> str:
+        if self._price_decimals == 0:
+            return f"{price:,.0f}{self._currency_symbol}"
+        return f"{self._currency_symbol}{price:,.{self._price_decimals}f}"
 
     def evaluate_entry(
         self,
@@ -77,7 +88,7 @@ class KRFujimoto126Algorithm(Algorithm):
         curr_entry_stage = int(existing_lot.algo_state.get("entry_stage", 0)) if existing_lot else 0
 
         rsi_th = float(p["rsi_oversold"])
-        unit_budget = float(p["total_budget_krw"]) / 9.0
+        unit_budget = float(p[self._budget_param_key]) / 9.0
 
         # Stage 1 (1/9): RSI oversold bounce
         if curr_entry_stage == 0:
@@ -93,7 +104,7 @@ class KRFujimoto126Algorithm(Algorithm):
                 symbol=symbol,
                 market=self.market,
                 price_type=PriceType.LIMIT,
-                price=round(curr_price, 0),
+                price=self._round_price(curr_price),
                 qty=qty,
                 qty_ratio=round(1.0 / 9.0, 4),
                 conditions=[cond],
@@ -116,7 +127,7 @@ class KRFujimoto126Algorithm(Algorithm):
                 symbol=symbol,
                 market=self.market,
                 price_type=PriceType.LIMIT,
-                price=round(curr_price, 0),
+                price=self._round_price(curr_price),
                 qty=qty,
                 qty_ratio=round(2.0 / 9.0, 4),
                 conditions=[cond],
@@ -129,7 +140,7 @@ class KRFujimoto126Algorithm(Algorithm):
         # Stage 3 (6/9): Ichimoku Cloud breakout
         if curr_entry_stage == 2:
             cloud_break = curr_price > cloud_top
-            cond = Condition("일목 구름대 돌파", round(curr_price, 0), round(cloud_top, 0), ">", cloud_break, "구름대 상단 돌파")
+            cond = Condition("일목 구름대 돌파", self._round_price(curr_price), self._round_price(cloud_top), ">", cloud_break, "구름대 상단 돌파")
             if not cloud_break:
                 return None
             qty = max(1, int((unit_budget * 6.0) // curr_price)) if (unit_budget * 6.0) >= curr_price else 1
@@ -140,12 +151,12 @@ class KRFujimoto126Algorithm(Algorithm):
                 symbol=symbol,
                 market=self.market,
                 price_type=PriceType.LIMIT,
-                price=round(curr_price, 0),
+                price=self._round_price(curr_price),
                 qty=qty,
                 qty_ratio=round(6.0 / 9.0, 4),
                 conditions=[cond],
                 score=90.0,
-                reason_text=f"후지모토 3단계 본격 매수(6/9) - 구름대 상단({cloud_top:,.0f}원) 돌파",
+                reason_text=f"후지모토 3단계 본격 매수(6/9) - 구름대 상단({self._fmt_price(cloud_top)}) 돌파",
                 lot_id=existing_lot.lot_id if existing_lot else None,
                 metadata={"next_entry_stage": 3},
             )
@@ -200,8 +211,8 @@ class KRFujimoto126Algorithm(Algorithm):
                 conditions.append(Condition("수익률(%)", round(pnl_rate * 100, 2), round(stop_loss * 100, 2), "<=", True, "비상 손절 도달"))
                 reason = f"3차 전량 청산 (비상 손절 {pnl_rate*100:+.1f}%)"
             else:
-                conditions.append(Condition("일목 구름대 하단 이탈", round(curr_price, 0), round(cloud_bottom, 0), "<", True, "추세 종료"))
-                reason = f"3차 전량 청산 (구름대 하단 {cloud_bottom:,.0f}원 이탈)"
+                conditions.append(Condition("일목 구름대 하단 이탈", self._round_price(curr_price), self._round_price(cloud_bottom), "<", True, "추세 종료"))
+                reason = f"3차 전량 청산 (구름대 하단 {self._fmt_price(cloud_bottom)} 이탈)"
         elif stage2_macd:
             target_stage = 2
             conditions.append(Condition("MACD Hist 데드크로스", round(macd_hist, 2), 0.0, "<", True, "모멘텀 음전환"))
@@ -231,7 +242,7 @@ class KRFujimoto126Algorithm(Algorithm):
             symbol=lot.symbol,
             market=self.market,
             price_type=PriceType.LIMIT,
-            price=round(curr_price, 0),
+            price=self._round_price(curr_price),
             qty=sell_qty,
             qty_ratio=round(ratio, 4),
             conditions=conditions,
@@ -240,3 +251,24 @@ class KRFujimoto126Algorithm(Algorithm):
             lot_id=lot.lot_id,
             metadata={"next_exit_stage": target_stage},
         )
+
+
+@register_algorithm
+class USFujimoto126Algorithm(KRFujimoto126Algorithm):
+    id = "us_fujimoto_126"
+    version = "1.0.0"
+    name = "후지모토 1:2:6 분할매매"
+    description = (
+        "미국 주식/ETF 대상 1단계(RSI 과매도 반등, 1/9) → 2단계(MACD 골든크로스, 2/9) → "
+        "3단계(일목 구름대 돌파, 6/9)로 분할 매수하고, 역방향 1:2:6으로 분할 청산합니다."
+    )
+    market = Market.US
+    _budget_param_key = "total_budget_usd"
+    _price_decimals = 2
+    _currency_symbol = "$"
+    params_schema = [
+        ParamSpec("total_budget_usd", "종목당 총 9유닛 예산(USD)", "float", 1_800.0, "1:2:6 전체(9유닛) 합산 예산 ($)", 90.0, 100_000.0, 90.0),
+        ParamSpec("rsi_oversold", "1단계 RSI 과매도 기준", "float", 30.0, "1단계 매수 RSI 기준선", 15.0, 45.0, 1.0),
+        ParamSpec("rsi_overbought", "1차 청산 RSI 과열 기준", "float", 70.0, "1차 청산 RSI 과열 기준선", 60.0, 85.0, 1.0),
+        ParamSpec("stop_loss_rate", "비상 손절률", "float", -0.05, "비상 손절 기준 수익률 (-0.05 = -5%)", -0.20, -0.01, 0.005),
+    ]

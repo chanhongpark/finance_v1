@@ -22,49 +22,73 @@ from core.sheets.user_sheet_manager import UserSheetManager
 logger = logging.getLogger(__name__)
 
 
-def run_kr_screening(
+def _run_market_screening(
+    market: Market,
     ctx: UserContext,
     sheet_manager: UserSheetManager,
     data_provider: HybridMarketDataProvider,
     universe_symbols: Sequence[str],
     include_live_quotes_for_candidates: bool = True,
+    exclude_algo_ids: Sequence[str] = (),
 ) -> Dict[str, List[Signal]]:
     """
-    Two-stage KR screening (R13, R14, R15 + API minimization):
+    Two-stage market screening (R13, R14, R15 + API minimization):
     - Stage 1: Fetch OHLCV for entire universe via FinanceDataReader + local cache (0 KIS API calls).
-      Evaluate all enabled KR algorithms independently (duplicate recommendations on same symbol allowed).
-    - Stage 2: Only for candidate symbols & OPEN KR lots, fetch KIS live quote and re-evaluate
-      for final buy/sell signals.
+      Evaluate all enabled algorithms for `market` independently (duplicate recommendations allowed).
+    - Stage 2: Only for candidate symbols & OPEN lots in `market`, fetch KIS live quote and
+      re-evaluate for final buy/sell signals.
     """
+    mkt_str = market.value
+    excluded = set(exclude_algo_ids)
+    norm_universe = [
+        s.strip().upper() if market == Market.US else s.strip()
+        for s in universe_symbols
+        if s and s.strip()
+    ]
+    norm_universe = list(dict.fromkeys(norm_universe))
+
     algo_configs = sheet_manager.load_algorithm_configs()
-    kr_algos = [
-        algo for algo in default_registry.list_all(market=Market.KR)
-        if algo_configs.get(algo.id, {}).get("enabled", True)
+    algos = [
+        algo for algo in default_registry.list_all(market=market)
+        if algo.id not in excluded and algo_configs.get(algo.id, {}).get("enabled", True)
     ]
 
-    open_kr_lots = [
+    open_lots = [
         l for l in sheet_manager.load_lots()
-        if l.status == LotStatus.OPEN and l.qty > 0 and l.market == "KR"
+        if l.status == LotStatus.OPEN
+        and l.qty > 0
+        and l.market.upper() == mkt_str
+        and l.algo_id not in excluded
     ]
-    lot_symbols = [l.symbol for l in open_kr_lots]
-    all_symbols = list(dict.fromkeys(list(universe_symbols) + lot_symbols))
+    lot_symbols = [
+        l.symbol.strip().upper() if market == Market.US else l.symbol.strip()
+        for l in open_lots
+    ]
+    all_symbols = list(dict.fromkeys(norm_universe + lot_symbols))
 
     # Stage 1: Batch historical OHLCV (0 KIS API calls)
-    ohlcv_map = data_provider.get_batch_daily_ohlcv(all_symbols, market="KR")
+    ohlcv_map = data_provider.get_batch_daily_ohlcv(all_symbols, market=mkt_str)
 
     stage1_candidate_symbols: List[str] = []
     stage1_buy_signals: List[Signal] = []
 
-    for sym in universe_symbols:
+    def _find_open_lot(sym: str, algo_id: str):
+        return next(
+            (
+                l for l in open_lots
+                if (l.symbol.strip().upper() if market == Market.US else l.symbol.strip()) == sym
+                and l.algo_id == algo_id
+            ),
+            None,
+        )
+
+    for sym in norm_universe:
         df = ohlcv_map.get(sym)
         if df is None or df.empty:
             continue
-        for algo in kr_algos:
+        for algo in algos:
             params = algo_configs.get(algo.id, {}).get("params", {})
-            existing_lot = next(
-                (l for l in open_kr_lots if l.symbol == sym and l.algo_id == algo.id),
-                None,
-            )
+            existing_lot = _find_open_lot(sym, algo.id)
             sig = algo.evaluate_entry(sym, df, params=params, extra={"existing_lot": existing_lot})
             if sig is not None:
                 stage1_buy_signals.append(sig)
@@ -82,7 +106,7 @@ def run_kr_screening(
             base_df = ohlcv_map.get(sym)
             if base_df is None:
                 continue
-            quote = data_provider.get_live_quote(sym, market="KR")
+            quote = data_provider.get_live_quote(sym, market=mkt_str)
             if quote:
                 ohlcv_map[sym] = data_provider.stitch_live_quote(base_df, quote)
 
@@ -91,21 +115,19 @@ def run_kr_screening(
             df = ohlcv_map.get(sym)
             if df is None or df.empty:
                 continue
-            for algo in kr_algos:
+            for algo in algos:
                 params = algo_configs.get(algo.id, {}).get("params", {})
-                existing_lot = next(
-                    (l for l in open_kr_lots if l.symbol == sym and l.algo_id == algo.id),
-                    None,
-                )
+                existing_lot = _find_open_lot(sym, algo.id)
                 sig = algo.evaluate_entry(sym, df, params=params, extra={"existing_lot": existing_lot})
                 if sig is not None:
                     buy_signals.append(sig)
     else:
         buy_signals = stage1_buy_signals
 
-    # Evaluate exits for all OPEN KR lots using latest registered version of lot.algo_id (R14)
-    for lot in open_kr_lots:
-        df = ohlcv_map.get(lot.symbol)
+    # Evaluate exits for all OPEN lots using latest registered version of lot.algo_id (R14)
+    for lot in open_lots:
+        sym_key = lot.symbol.strip().upper() if market == Market.US else lot.symbol.strip()
+        df = ohlcv_map.get(sym_key)
         if df is None or df.empty:
             continue
         curr_price = float(df["close"].iloc[-1])
@@ -125,6 +147,43 @@ def run_kr_screening(
             sell_signals.append(exit_sig)
 
     return {"buy": buy_signals, "sell": sell_signals}
+
+
+def run_kr_screening(
+    ctx: UserContext,
+    sheet_manager: UserSheetManager,
+    data_provider: HybridMarketDataProvider,
+    universe_symbols: Sequence[str],
+    include_live_quotes_for_candidates: bool = True,
+) -> Dict[str, List[Signal]]:
+    """Two-stage KR screening (월간추세 · 컵앤핸들 · 후지모토 1:2:6)."""
+    return _run_market_screening(
+        market=Market.KR,
+        ctx=ctx,
+        sheet_manager=sheet_manager,
+        data_provider=data_provider,
+        universe_symbols=universe_symbols,
+        include_live_quotes_for_candidates=include_live_quotes_for_candidates,
+    )
+
+
+def run_us_screening(
+    ctx: UserContext,
+    sheet_manager: UserSheetManager,
+    data_provider: HybridMarketDataProvider,
+    universe_symbols: Sequence[str],
+    include_live_quotes_for_candidates: bool = True,
+) -> Dict[str, List[Signal]]:
+    """Two-stage US screening (월간추세 · 컵앤핸들 · 후지모토 1:2:6, excluding infinite buying)."""
+    return _run_market_screening(
+        market=Market.US,
+        ctx=ctx,
+        sheet_manager=sheet_manager,
+        data_provider=data_provider,
+        universe_symbols=universe_symbols,
+        include_live_quotes_for_candidates=include_live_quotes_for_candidates,
+        exclude_algo_ids=("us_infinite_buying",),
+    )
 
 
 def run_us_infinite_buying(

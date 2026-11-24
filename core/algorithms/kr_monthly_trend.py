@@ -32,6 +32,9 @@ class KRMonthlyTrendAlgorithm(Algorithm):
         "안정적으로 상회할 때 매수하고, 10개월선 하향 이탈 또는 비상 손절/목표 익절 시 청산합니다."
     )
     market = Market.KR
+    _budget_param_key: str = "budget_per_stock_krw"
+    _price_decimals: int = 0
+    _currency_symbol: str = "원"
     params_schema = [
         ParamSpec("monthly_sma_period", "월봉 이평 기간", "int", 10, "추세 판별 월봉 SMA 기간 (개월)", 3, 24, 1),
         ParamSpec("allow_trend_continuation", "추세 지속 진입 허용", "bool", False, "신규 골든크로스 외 10이평 상회 지속 종목도 진입 허용"),
@@ -42,6 +45,14 @@ class KRMonthlyTrendAlgorithm(Algorithm):
         ParamSpec("budget_per_stock_krw", "종목당 기본 예산(원)", "float", 1_000_000.0, "1회 진입 시 기본 배정 예산", 100_000.0, 20_000_000.0, 100_000.0),
         ParamSpec("high_price_limit_enabled", "100만원 초과 고가주 1주 제한", "bool", True, "주가 100만원 초과 시 최대 1주 제한"),
     ]
+
+    def _round_price(self, price: float) -> float:
+        return round(price, self._price_decimals)
+
+    def _fmt_price(self, price: float) -> str:
+        if self._price_decimals == 0:
+            return f"{price:,.0f}{self._currency_symbol}"
+        return f"{self._currency_symbol}{price:,.{self._price_decimals}f}"
 
     @staticmethod
     def _get_monthly_df(data: pd.DataFrame, extra: Optional[Dict[str, Any]] = None) -> pd.DataFrame:
@@ -83,8 +94,8 @@ class KRMonthlyTrendAlgorithm(Algorithm):
 
         cond_above_sma = Condition(
             name=f"월봉종가 vs SMA({sma_period})",
-            value=round(curr_close, 0),
-            threshold=round(curr_sma, 0),
+            value=self._round_price(curr_close),
+            threshold=self._round_price(curr_sma),
             op=">",
             passed=curr_close > curr_sma,
             desc="월봉 종가가 이동평균선 위에 위치",
@@ -139,8 +150,8 @@ class KRMonthlyTrendAlgorithm(Algorithm):
         if not cond_score.passed:
             return None
 
-        budget = float(p["budget_per_stock_krw"])
-        if bool(p["high_price_limit_enabled"]) and curr_close > 1_000_000:
+        budget = float(p[self._budget_param_key])
+        if bool(p.get("high_price_limit_enabled", False)) and curr_close > 1_000_000:
             qty = 1 if budget >= curr_close else 0
         else:
             qty = max(1, int(budget // curr_close)) if budget >= curr_close else 0
@@ -156,7 +167,7 @@ class KRMonthlyTrendAlgorithm(Algorithm):
             symbol=symbol,
             market=self.market,
             price_type=PriceType.LIMIT,
-            price=round(curr_close, 0),
+            price=self._round_price(curr_close),
             qty=qty,
             conditions=conditions,
             score=score,
@@ -207,14 +218,14 @@ class KRMonthlyTrendAlgorithm(Algorithm):
                     conditions.append(
                         Condition(
                             f"현재가 vs 월봉SMA({sma_period})",
-                            round(curr_price, 0),
-                            round(curr_sma, 0),
+                            self._round_price(curr_price),
+                            self._round_price(curr_sma),
                             "<",
                             True,
                             "월봉 추세선 하향 이탈",
                         )
                     )
-                    reason = f"월봉 {sma_period}이평({curr_sma:,.0f}원) 하향 이탈"
+                    reason = f"월봉 {sma_period}이평({self._fmt_price(curr_sma)}) 하향 이탈"
 
         if not reason:
             return None
@@ -226,7 +237,7 @@ class KRMonthlyTrendAlgorithm(Algorithm):
             symbol=lot.symbol,
             market=self.market,
             price_type=PriceType.LIMIT,
-            price=round(curr_price, 0),
+            price=self._round_price(curr_price),
             qty=lot.qty,
             qty_ratio=1.0,
             conditions=conditions,
@@ -234,3 +245,27 @@ class KRMonthlyTrendAlgorithm(Algorithm):
             reason_text=reason,
             lot_id=lot.lot_id,
         )
+
+
+@register_algorithm
+class USMonthlyTrendAlgorithm(KRMonthlyTrendAlgorithm):
+    id = "us_monthly_trend"
+    version = "1.0.0"
+    name = "월봉 10이평 추세추종 (GTAA)"
+    description = (
+        "미국 주식/ETF 대상 월봉 종가가 10개월 단순이동평균(SMA10)을 상향 돌파하거나 "
+        "안정적으로 상회할 때 매수하고, 10개월선 하향 이탈 또는 비상 손절/목표 익절 시 청산합니다."
+    )
+    market = Market.US
+    _budget_param_key = "budget_per_stock_usd"
+    _price_decimals = 2
+    _currency_symbol = "$"
+    params_schema = [
+        ParamSpec("monthly_sma_period", "월봉 이평 기간", "int", 10, "추세 판별 월봉 SMA 기간 (개월)", 3, 24, 1),
+        ParamSpec("allow_trend_continuation", "추세 지속 진입 허용", "bool", False, "신규 골든크로스 외 10이평 상회 지속 종목도 진입 허용"),
+        ParamSpec("max_high_chase_pct", "이격도 과열 상한", "float", 0.20, "10개월선 대비 과열 추격 매수 차단 비율 (0.20 = +20%)", 0.05, 0.50, 0.01),
+        ParamSpec("target_profit_rate", "목표 익절률", "float", 0.20, "목표 익절 수익률 (0.20 = +20%)", 0.05, 1.00, 0.05),
+        ParamSpec("stop_loss_rate", "비상 손절률", "float", -0.07, "일봉 기준 비상 손절 수익률 (-0.07 = -7%)", -0.25, -0.02, 0.005),
+        ParamSpec("buy_score_threshold", "최소 매수 점수", "int", 60, "매수 추천 최소 종합 점수 (0~100)", 0, 100, 5),
+        ParamSpec("budget_per_stock_usd", "종목당 기본 예산(USD)", "float", 1_000.0, "1회 진입 시 기본 배정 예산 ($)", 100.0, 50_000.0, 100.0),
+    ]

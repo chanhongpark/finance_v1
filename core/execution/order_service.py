@@ -238,14 +238,14 @@ class OrderService:
     @staticmethod
     def _find_target_buy_lot(signal: Signal, all_lots: List[Lot]) -> Optional[Lot]:
         """
-        For stateful split-buy algorithms (us_infinite_buying, kr_fujimoto_126) or explicit lot_id,
+        For stateful split-buy algorithms (us_infinite_buying, kr_fujimoto_126, us_fujimoto_126) or explicit lot_id,
         append new BUY Fill to the existing OPEN lot of the same (symbol, algo_id) (R5.3).
         """
         if signal.lot_id:
             for lot in all_lots:
                 if lot.lot_id == signal.lot_id and lot.status == LotStatus.OPEN:
                     return lot
-        if signal.algo_id in {"us_infinite_buying", "kr_fujimoto_126"}:
+        if signal.algo_id in {"us_infinite_buying", "kr_fujimoto_126", "us_fujimoto_126"}:
             for lot in all_lots:
                 if lot.symbol == signal.symbol and lot.algo_id == signal.algo_id and lot.status == LotStatus.OPEN:
                     return lot

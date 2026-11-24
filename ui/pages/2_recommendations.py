@@ -4,7 +4,7 @@ from __future__ import annotations
 import streamlit as st
 
 from core.algorithms import Market, USInfiniteBuyingAlgorithm, default_registry
-from core.execution.runner import run_kr_screening
+from core.execution.runner import run_kr_screening, run_us_screening
 from core.ledger.models import LotStatus
 from ui.auth import AppServices
 from ui.components.order_dialog import open_order_confirmation_dialog
@@ -12,6 +12,7 @@ from ui.components.responsive_cards import render_signal_card
 from ui.components.tooltips import build_algorithm_tooltip
 
 DEFAULT_KR_WATCHLIST = "005930,000660,035420,005380,051910,035720,068270,105560,055550,012330"
+DEFAULT_US_WATCHLIST = "AAPL,MSFT,NVDA,AMZN,GOOGL,META,TSLA,QQQ,SPY,SCHD"
 DEFAULT_US_SYMBOLS = "TQQQ,SOXL"
 
 
@@ -31,7 +32,11 @@ def _parse_symbols(raw: str, *, upper: bool = False) -> list[str]:
 def render_recommendations(services: AppServices) -> None:
     st.title("🎯 오늘의 추천 (매수 / 매도)")
 
-    tab_kr, tab_us = st.tabs(["🇰🇷 국내 주식 추천 (월간추세 · 컵앤핸들 · 후지모토 1:2:6)", "🇺🇸 미국 무한매수 현황"])
+    tab_kr, tab_us_screen, tab_us_inf = st.tabs([
+        "🇰🇷 국내 주식 추천 (월간추세 · 컵앤핸들 · 후지모토 1:2:6)",
+        "🇺🇸 미국 주식 추천 (월간추세 · 컵앤핸들 · 후지모토 1:2:6)",
+        "🇺🇸 미국 무한매수 현황",
+    ])
 
     with tab_kr:
         st.caption(
@@ -108,7 +113,85 @@ def render_recommendations(services: AppServices) -> None:
                     symbol_name=services.data_provider.get_symbol_name(sig.symbol, sig.market.value),
                 )
 
-    with tab_us:
+    with tab_us_screen:
+        st.caption(
+            "1단계에서 FinanceDataReader + 로컬 증분 캐시로 미국 주식/ETF를 고속 스크리닝(KIS API 0회) 후, "
+            "2단계에서 최종 후보 및 보유 종목만 KIS 실시간 현재가를 결합합니다. "
+            "여러 알고리즘이 같은 종목을 추천하면 각각 별도 행으로 표시되며 독립 매수가 가능합니다."
+        )
+
+        us_screen_algos = [
+            a for a in default_registry.list_all(market=Market.US)
+            if a.id != "us_infinite_buying"
+        ]
+        if us_screen_algos:
+            cols_us = st.columns(len(us_screen_algos))
+            for col, algo in zip(cols_us, us_screen_algos):
+                col.markdown(f"**{algo.name}** ⓘ", help=build_algorithm_tooltip(algo))
+
+        raw_settings = services.sheet.load_raw_settings()
+        saved_us_watchlist = raw_settings.get("us_watchlist", DEFAULT_US_WATCHLIST)
+        us_watchlist_input = st.text_input(
+            "스크리닝 대상 미국 티커 (쉼표 구분)",
+            value=saved_us_watchlist,
+            help="미국 주식/ETF 티커를 쉼표로 구분하여 입력합니다. 저장하거나 스크리닝 실행 시 개인 Sheet에 저장됩니다.",
+        )
+
+        btn_us_scr_run, btn_us_scr_save = st.columns([2, 1])
+        run_us_scr_clicked = btn_us_scr_run.button("🔍 미국 추천 스크리닝 실행", type="primary", use_container_width=True)
+        save_us_scr_clicked = btn_us_scr_save.button("💾 미국 종목 목록 저장", use_container_width=True)
+
+        if save_us_scr_clicked:
+            us_watch_syms = _parse_symbols(us_watchlist_input, upper=True)
+            if not us_watch_syms:
+                st.warning("미국 티커를 1개 이상 입력해 주세요.")
+            else:
+                services.sheet.save_setting("us_watchlist", ",".join(us_watch_syms))
+                st.success(f"✅ 미국 스크리닝 종목({len(us_watch_syms)}개)이 개인 Sheet에 저장되었습니다.")
+
+        if run_us_scr_clicked:
+            us_watch_syms = _parse_symbols(us_watchlist_input, upper=True)
+            if not us_watch_syms:
+                st.warning("미국 티커를 1개 이상 입력해 주세요.")
+            else:
+                normalized_us_watch = ",".join(us_watch_syms)
+                if normalized_us_watch != saved_us_watchlist:
+                    services.sheet.save_setting("us_watchlist", normalized_us_watch)
+                with st.spinner(f"{len(us_watch_syms)}개 미국 종목 1단계(FDR 캐시) → 2단계(KIS 실시간) 평가 중..."):
+                    us_result = run_us_screening(
+                        ctx=services.ctx,
+                        sheet_manager=services.sheet,
+                        data_provider=services.data_provider,
+                        universe_symbols=us_watch_syms,
+                        include_live_quotes_for_candidates=True,
+                    )
+                st.session_state["us_screening_result"] = us_result
+
+        us_result = st.session_state.get("us_screening_result")
+        if us_result:
+            st.subheader(f"🔴 미국 매도 / 청산 제안 ({len(us_result['sell'])}건)")
+            if not us_result["sell"]:
+                st.caption("현재 청산 조건에 도달한 미국 보유 건이 없습니다.")
+            for idx, sig in enumerate(us_result["sell"]):
+                render_signal_card(
+                    sig,
+                    idx + 3000,
+                    on_order_click=lambda s: open_order_confirmation_dialog(services, s),
+                    symbol_name=services.data_provider.get_symbol_name(sig.symbol, sig.market.value),
+                )
+
+            st.subheader(f"🟢 미국 신규 / 추가 매수 제안 ({len(us_result['buy'])}건)")
+            if not us_result["buy"]:
+                st.caption("현재 진입 조건을 충족한 미국 종목이 없습니다.")
+            for idx, sig in enumerate(us_result["buy"]):
+                render_signal_card(
+                    sig,
+                    idx + 4000,
+                    on_order_click=lambda s: open_order_confirmation_dialog(services, s),
+                    symbol_name=services.data_provider.get_symbol_name(sig.symbol, sig.market.value),
+                )
+
+    with tab_us_inf:
         us_algo = default_registry.require("us_infinite_buying")
         assert isinstance(us_algo, USInfiniteBuyingAlgorithm)
         st.markdown(f"**{us_algo.name}** ⓘ", help=build_algorithm_tooltip(us_algo))

@@ -92,7 +92,7 @@ def open_lot_editor_dialog(services: AppServices, manual_lot: Optional[Lot] = No
     )
 
     algo_state = {}
-    if selected_algo_id == "kr_fujimoto_126":
+    if selected_algo_id in {"kr_fujimoto_126", "us_fujimoto_126"}:
         st.markdown("##### 후지모토 1:2:6 진행 단계 설정")
         fc1, fc2 = st.columns(2)
         entry_stage = fc1.selectbox(
