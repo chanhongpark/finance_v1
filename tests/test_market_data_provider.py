@@ -47,3 +47,51 @@ def test_stage1_batch_uses_fdr_and_cache_with_zero_kis_calls(tmp_path: Path) -> 
     assert mock_kis.quote_call_count == 1
     assert float(live_df["close"].iloc[-1]) == 75_500.0
     assert str(live_df["date"].iloc[-1]) == "2026-11-16"
+
+
+def test_kis_us_quote_falls_back_across_nas_nys_ams_and_caches(tmp_path: Path, monkeypatch) -> None:
+    from core.kis.client import KISClient
+
+    ctx = UserContext(
+        "u_us",
+        UserCredentials(kis_app_key="k", kis_app_secret="s", kis_account_no="12345678-01", is_mock=True),
+        "sheet_us",
+        base_data_dir=tmp_path / "data",
+    )
+    client = KISClient(ctx, calls_per_second=100.0)
+    monkeypatch.setattr(client, "get_access_token", lambda: "fake_token")
+
+    tried_exchanges: list[str] = []
+
+    class FakeResp:
+        def __init__(self, payload: dict) -> None:
+            self._payload = payload
+
+        def raise_for_status(self) -> None:
+            return None
+
+        def json(self) -> dict:
+            return self._payload
+
+    def fake_get(url, headers=None, params=None, timeout=None):
+        excd = params["EXCD"]
+        tried_exchanges.append(excd)
+        if excd == "AMS":
+            return FakeResp({"output": {"last": "32.45", "open": "31.90", "high": "33.00", "low": "31.50", "tvol": "12345"}})
+        return FakeResp({"output": {"last": "", "base": ""}})
+
+    monkeypatch.setattr("core.kis.client.requests.get", fake_get)
+
+    # First lookup tries NAS -> NYS -> AMS and succeeds on AMS
+    quote = client.get_current_price("SOXL", market="US")
+    assert quote is not None
+    assert quote["price"] == 32.45
+    assert quote["exchange"] == "AMS"
+    assert tried_exchanges == ["NAS", "NYS", "AMS"]
+
+    # Second lookup hits cached AMS immediately (1 call)
+    tried_exchanges.clear()
+    quote2 = client.get_current_price("SOXL", market="US")
+    assert quote2 is not None
+    assert quote2["price"] == 32.45
+    assert tried_exchanges == ["AMS"]

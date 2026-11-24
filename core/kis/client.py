@@ -45,6 +45,11 @@ US_ORD_DVSN: Dict[tuple, str] = {
     ("SELL", "LOC"): "34",
 }
 
+US_QUOTE_EXCHANGES = ("NAS", "NYS", "AMS")
+_US_EXCD_TO_ORDER_EXCG = {"NAS": "NASD", "NYS": "NYSE", "AMS": "AMEX"}
+_US_ORDER_EXCG_TO_EXCD = {"NASD": "NAS", "NYSE": "NYS", "AMEX": "AMS"}
+
+
 class KISClient:
     """Per-user KIS API client with isolated token cache in data/<user_id>/kis_token.json."""
 
@@ -61,6 +66,7 @@ class KISClient:
         self._token_path: Path = ctx.resolve_user_path("kis_token.json")
         self._access_token: Optional[str] = None
         self._token_expires_at: Optional[datetime] = None
+        self._us_exchange_cache: Dict[str, str] = {}
 
     def _load_cached_token(self) -> Optional[str]:
         if not self._token_path.exists():
@@ -130,8 +136,8 @@ class KISClient:
 
     def get_current_price(self, symbol: str, market: str = "KR", exchange: str = "NAS") -> Optional[Dict[str, Any]]:
         """Fetch real-time quote for a single symbol (Stage 2 only)."""
-        self.rate_limiter.acquire()
         if market.upper() == "KR":
+            self.rate_limiter.acquire()
             url = f"{self.base_url}/uapi/domestic-stock/v1/quotations/inquire-price"
             headers = self._headers("FHKST01010100")
             params = {"FID_COND_MRKT_DIV_CODE": "J", "FID_INPUT_ISCD": symbol}
@@ -150,23 +156,35 @@ class KISClient:
                 "volume": float(out.get("acml_vol", 0) or 0),
             }
 
+        sym = symbol.upper()
         url = f"{self.base_url}/uapi/overseas-price/v1/quotations/price"
         headers = self._headers("HHDFS00000300")
-        params = {"AUTH": "", "EXCD": exchange, "SYMB": symbol.upper()}
-        resp = requests.get(url, headers=headers, params=params, timeout=self.timeout)
-        resp.raise_for_status()
-        out = resp.json().get("output", {})
-        price = float(out.get("last", 0) or 0)
-        if price <= 0:
-            return None
-        return {
-            "symbol": symbol.upper(),
-            "price": price,
-            "open": float(out.get("open", price) or price),
-            "high": float(out.get("high", price) or price),
-            "low": float(out.get("low", price) or price),
-            "volume": float(out.get("tvol", 0) or 0),
-        }
+
+        candidates: List[str] = []
+        cached_excd = self._us_exchange_cache.get(sym)
+        for excd in (cached_excd, exchange, *US_QUOTE_EXCHANGES):
+            if excd and excd not in candidates:
+                candidates.append(excd)
+
+        for excd in candidates:
+            self.rate_limiter.acquire()
+            params = {"AUTH": "", "EXCD": excd, "SYMB": sym}
+            resp = requests.get(url, headers=headers, params=params, timeout=self.timeout)
+            resp.raise_for_status()
+            out = resp.json().get("output", {})
+            price = float(out.get("last", 0) or out.get("base", 0) or 0)
+            if price > 0:
+                self._us_exchange_cache[sym] = excd
+                return {
+                    "symbol": sym,
+                    "exchange": excd,
+                    "price": price,
+                    "open": float(out.get("open", price) or price),
+                    "high": float(out.get("high", price) or price),
+                    "low": float(out.get("low", price) or price),
+                    "volume": float(out.get("tvol", 0) or 0),
+                }
+        return None
 
     def inquire_balance(self, market: str = "KR", exchange: str = "NASD") -> List[Dict[str, Any]]:
         """Return actual broker holdings: [{symbol, market, qty, avg_price, current_price}]."""
@@ -225,9 +243,13 @@ class KISClient:
             qty = int(float(it.get("ovrs_cblc_qty", 0) or 0))
             if qty <= 0:
                 continue
+            sym = str(it.get("ovrs_pdno", "")).strip().upper()
+            excg = str(it.get("ovrs_excg_cd", "")).strip().upper()
+            if sym and excg in _US_ORDER_EXCG_TO_EXCD:
+                self._us_exchange_cache[sym] = _US_ORDER_EXCG_TO_EXCD[excg]
             holdings.append(
                 {
-                    "symbol": str(it.get("ovrs_pdno", "")).strip().upper(),
+                    "symbol": sym,
                     "name": str(it.get("ovrs_item_name", "")).strip(),
                     "market": "US",
                     "qty": qty,
@@ -287,11 +309,15 @@ class KISClient:
             return {"success": False, "order_no": "", "message": f"미국 주식 {side_u}에서 지원하지 않는 주문유형: {price_type}"}
         if ord_dvsn in {"31", "33"}:  # MOO / MOC: price is broker-determined
             price = 0.0
+        sym = symbol.upper()
+        resolved_exchange = exchange
+        if exchange == "NASD" and sym in self._us_exchange_cache:
+            resolved_exchange = _US_EXCD_TO_ORDER_EXCG.get(self._us_exchange_cache[sym], exchange)
         body = {
             "CANO": self.ctx.credentials.account_prefix,
             "ACNT_PRDT_CD": self.ctx.credentials.account_suffix,
-            "OVRS_EXCG_CD": exchange,
-            "PDNO": symbol.upper(),
+            "OVRS_EXCG_CD": resolved_exchange,
+            "PDNO": sym,
             "ORD_QTY": str(int(qty)),
             "OVRS_ORD_UNPR": f"{price:.2f}",
             "ORD_SVR_DVSN_CD": "0",
