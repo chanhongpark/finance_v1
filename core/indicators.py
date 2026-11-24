@@ -286,6 +286,8 @@ def detect_cup_and_handle(
                 best_score = score
                 target_price = pivot_price + (p2_price - cup_low)
                 stop_loss_price = max(handle_low, pivot_price * 0.93)
+                handle_low_idx = actual_p2_idx + 1 + int(np.argmin(handle_lows))
+                dates_arr = df["date"].astype(str).values if "date" in df.columns else None
                 best_pattern = {
                     "is_pattern": True,
                     "status": "breakout" if is_breakout else ("near_pivot" if is_near_pivot else "forming_handle"),
@@ -302,6 +304,11 @@ def detect_cup_and_handle(
                     "vol_ratio": round(vol_ratio, 2),
                     "vol_confirmed": bool(vol_confirmed),
                     "score": min(100, score),
+                    "p1_date": str(dates_arr[p1_idx])[:10] if dates_arr is not None else None,
+                    "cup_low_date": str(dates_arr[cup_low_idx])[:10] if dates_arr is not None else None,
+                    "p2_date": str(dates_arr[actual_p2_idx])[:10] if dates_arr is not None else None,
+                    "handle_low_date": str(dates_arr[handle_low_idx])[:10] if dates_arr is not None else None,
+                    "breakout_date": str(dates_arr[curr_idx])[:10] if dates_arr is not None else None,
                 }
 
     return best_pattern

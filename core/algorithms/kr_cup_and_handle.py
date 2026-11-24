@@ -152,6 +152,21 @@ class KRCupAndHandleAlgorithm(Algorithm):
             metadata={
                 "target_price": self._round_price(float(pattern["target_price"])),
                 "stop_loss_price": self._round_price(float(pattern["stop_loss_price"])),
+                "pivot_price": self._round_price(pivot_price),
+                "cup_pattern": {
+                    "p1_date": pattern.get("p1_date"),
+                    "p1_price": self._round_price(float(pattern["p1_price"])),
+                    "cup_low_date": pattern.get("cup_low_date"),
+                    "cup_low_price": self._round_price(float(pattern["cup_low_price"])),
+                    "p2_date": pattern.get("p2_date"),
+                    "p2_price": self._round_price(float(pattern["p2_price"])),
+                    "handle_low_date": pattern.get("handle_low_date"),
+                    "handle_low_price": self._round_price(float(pattern["handle_low_price"])),
+                    "breakout_date": pattern.get("breakout_date"),
+                    "pivot_price": self._round_price(pivot_price),
+                    "cup_depth_pct": pattern.get("cup_depth_pct"),
+                    "handle_depth_pct": pattern.get("handle_depth_pct"),
+                },
             },
         )
 

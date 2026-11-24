@@ -172,6 +172,7 @@ class KRMonthlyTrendAlgorithm(Algorithm):
             conditions=conditions,
             score=score,
             reason_text=f"{tag} (SMA{sma_period} 이격 +{distance_pct*100:.1f}%)",
+            metadata={"monthly_sma_period": sma_period},
         )
 
     def evaluate_exit(
@@ -244,6 +245,7 @@ class KRMonthlyTrendAlgorithm(Algorithm):
             score=100.0,
             reason_text=reason,
             lot_id=lot.lot_id,
+            metadata={"monthly_sma_period": sma_period},
         )
 
 

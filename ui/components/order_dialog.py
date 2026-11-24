@@ -20,12 +20,16 @@ from plotly.subplots import make_subplots
 
 from core.algorithms.base import PRICE_TYPE_HELP, SUPPORTED_PRICE_TYPES, PriceType, Signal, SignalAction
 from core.execution.order_service import OrderService
-from core.indicators import calculate_technical_indicators
+from core.indicators import calculate_technical_indicators, resample_to_monthly
 from ui.auth import AppServices
 
 CHART_LOOKBACK_DAYS = 200
+MONTHLY_CHART_LOOKBACK_DAYS = 750
 CHART_BARS = 120
+MONTHLY_CHART_BARS = 24
 FUJIMOTO_ALGO_IDS = {"kr_fujimoto_126", "us_fujimoto_126"}
+MONTHLY_TREND_ALGO_IDS = {"kr_monthly_trend", "us_monthly_trend"}
+CUP_AND_HANDLE_ALGO_IDS = {"kr_cup_and_handle", "us_cup_and_handle"}
 
 
 def kr_tick_size(price: float) -> int:
@@ -63,21 +67,47 @@ def _build_price_chart(
     order_price: Optional[float],
     avg_price: Optional[float],
 ) -> go.Figure:
+    meta = signal.metadata or {}
+    is_monthly = signal.algo_id in MONTHLY_TREND_ALGO_IDS
     show_fujimoto = signal.algo_id in FUJIMOTO_ALGO_IDS
-    ind_df = calculate_technical_indicators(df, min_bars=5) if show_fujimoto else None
-    if ind_df is not None and not ind_df.empty:
-        data = ind_df.copy()
-        data["date"] = pd.to_datetime(data["date"].astype(str).str[:10], errors="coerce")
-        data = data.dropna(subset=["date"]).sort_values("date")
-    else:
-        show_fujimoto = False
-        data = df.copy()
-        data["date"] = pd.to_datetime(data["date"].astype(str).str[:10], errors="coerce")
-        data = data.dropna(subset=["date"]).sort_values("date")
-        data["ma20"] = data["close"].rolling(20).mean()
-        data["ma60"] = data["close"].rolling(60).mean()
+    cup_pat = meta.get("cup_pattern") if signal.algo_id in CUP_AND_HANDLE_ALGO_IDS else None
 
-    data = data.tail(CHART_BARS)
+    if is_monthly:
+        sma_period = int(meta.get("monthly_sma_period", 10) or 10)
+        monthly = resample_to_monthly(df)
+        monthly["date"] = pd.to_datetime(monthly["date"].astype(str).str[:10], errors="coerce")
+        monthly = monthly.dropna(subset=["date"]).sort_values("date")
+        monthly["monthly_sma"] = monthly["close"].rolling(window=sma_period).mean()
+        data = monthly.tail(MONTHLY_CHART_BARS)
+    else:
+        sma_period = 10
+        ind_df = calculate_technical_indicators(df, min_bars=5) if show_fujimoto else None
+        if ind_df is not None and not ind_df.empty:
+            data = ind_df.copy()
+            data["date"] = pd.to_datetime(data["date"].astype(str).str[:10], errors="coerce")
+            data = data.dropna(subset=["date"]).sort_values("date")
+        else:
+            show_fujimoto = False
+            data = df.copy()
+            data["date"] = pd.to_datetime(data["date"].astype(str).str[:10], errors="coerce")
+            data = data.dropna(subset=["date"]).sort_values("date")
+            data["ma20"] = data["close"].rolling(20).mean()
+            data["ma60"] = data["close"].rolling(60).mean()
+
+        if isinstance(cup_pat, dict) and cup_pat.get("p1_date"):
+            p1_dt = pd.to_datetime(cup_pat["p1_date"], errors="coerce")
+            if pd.notna(p1_dt):
+                # Ensure the full cup (plus a small left margin) is visible
+                min_dt = p1_dt - pd.Timedelta(days=20)
+                tail_df = data.tail(CHART_BARS)
+                if not tail_df.empty and tail_df["date"].iloc[0] > min_dt:
+                    data = data[data["date"] >= min_dt]
+                else:
+                    data = tail_df
+            else:
+                data = data.tail(CHART_BARS)
+        else:
+            data = data.tail(CHART_BARS)
 
     if show_fujimoto:
         fig = make_subplots(
@@ -132,7 +162,7 @@ def _build_price_chart(
             high=data["high"],
             low=data["low"],
             close=data["close"],
-            name="일봉",
+            name="월봉" if is_monthly else "일봉",
             # Korean convention: up = red, down = blue
             increasing_line_color="#d6334c",
             increasing_fillcolor="#d6334c",
@@ -142,8 +172,78 @@ def _build_price_chart(
         row=1,
         col=1,
     )
-    fig.add_trace(go.Scatter(x=data["date"], y=data["ma20"], name="MA20", line=dict(color="#e8a33d", width=1.4)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=data["date"], y=data["ma60"], name="MA60", line=dict(color="#8a63d2", width=1.4)), row=1, col=1)
+
+    if is_monthly:
+        fig.add_trace(
+            go.Scatter(
+                x=data["date"],
+                y=data["monthly_sma"],
+                name=f"월봉 SMA({sma_period})",
+                line=dict(color="#e8a33d", width=2.0),
+            ),
+            row=1,
+            col=1,
+        )
+    else:
+        fig.add_trace(go.Scatter(x=data["date"], y=data["ma20"], name="MA20", line=dict(color="#e8a33d", width=1.4)), row=1, col=1)
+        fig.add_trace(go.Scatter(x=data["date"], y=data["ma60"], name="MA60", line=dict(color="#8a63d2", width=1.4)), row=1, col=1)
+
+    # Cup & Handle pattern overlay (cup zone, handle zone, key contour points, pivot line)
+    if isinstance(cup_pat, dict) and cup_pat.get("p1_date") and cup_pat.get("p2_date"):
+        p1_dt = pd.to_datetime(cup_pat["p1_date"], errors="coerce")
+        p2_dt = pd.to_datetime(cup_pat["p2_date"], errors="coerce")
+        cup_low_dt = pd.to_datetime(cup_pat.get("cup_low_date"), errors="coerce")
+        handle_low_dt = pd.to_datetime(cup_pat.get("handle_low_date"), errors="coerce")
+        breakout_dt = pd.to_datetime(cup_pat.get("breakout_date"), errors="coerce")
+
+        if pd.notna(p1_dt) and pd.notna(p2_dt):
+            cup_depth_lbl = f"컵 (-{cup_pat.get('cup_depth_pct')}%)" if cup_pat.get("cup_depth_pct") is not None else "컵(Cup)"
+            fig.add_vrect(
+                x0=p1_dt,
+                x1=p2_dt,
+                fillcolor="rgba(59, 130, 246, 0.10)",
+                line_width=0,
+                annotation_text=cup_depth_lbl,
+                annotation_position="top left",
+                annotation_font_color="#2563eb",
+                row=1,
+                col=1,
+            )
+        if pd.notna(p2_dt) and pd.notna(breakout_dt) and breakout_dt > p2_dt:
+            fig.add_vrect(
+                x0=p2_dt,
+                x1=breakout_dt,
+                fillcolor="rgba(245, 158, 11, 0.14)",
+                line_width=0,
+                annotation_text="핸들",
+                annotation_position="top left",
+                annotation_font_color="#d97706",
+                row=1,
+                col=1,
+            )
+
+        contour_pts = [
+            (p1_dt, cup_pat.get("p1_price"), "좌측고점"),
+            (cup_low_dt, cup_pat.get("cup_low_price"), "컵바닥"),
+            (p2_dt, cup_pat.get("p2_price"), "우측고점"),
+            (handle_low_dt, cup_pat.get("handle_low_price"), "핸들저점"),
+        ]
+        valid_pts = [(dt, float(pr), lbl) for dt, pr, lbl in contour_pts if pd.notna(dt) and pr is not None]
+        if len(valid_pts) >= 3:
+            fig.add_trace(
+                go.Scatter(
+                    x=[pt[0] for pt in valid_pts],
+                    y=[pt[1] for pt in valid_pts],
+                    text=[pt[2] for pt in valid_pts],
+                    textposition="top center",
+                    mode="lines+markers+text",
+                    name="컵앤핸들 패턴",
+                    line=dict(color="#0ea5e9", width=2.0, dash="dash"),
+                    marker=dict(size=7, color="#0ea5e9"),
+                ),
+                row=1,
+                col=1,
+            )
 
     vol_colors = ["#d6334c" if c >= o else "#2f6fdb" for o, c in zip(data["open"], data["close"])]
     fig.add_trace(go.Bar(x=data["date"], y=data["volume"], name="거래량", marker_color=vol_colors, opacity=0.6, showlegend=False), row=2, col=1)
@@ -184,7 +284,7 @@ def _build_price_chart(
     action_color = "#1a9e5c" if signal.action == SignalAction.BUY else "#d6334c"
     _hline(order_price, "주문가", action_color, "solid")
     _hline(avg_price, "평단가", "#6b7280", "dot")
-    meta = signal.metadata or {}
+    _hline(meta.get("pivot_price"), "피봇선", "#0ea5e9", "dashdot")
     _hline(meta.get("target_price"), "목표가", "#1a9e5c", "dash")
     _hline(meta.get("stop_loss_price"), "손절가", "#d6334c", "dash")
 
@@ -195,17 +295,19 @@ def _build_price_chart(
         legend=dict(orientation="h", yanchor="bottom", y=1.0, xanchor="right", x=1),
         hovermode="x unified",
     )
-    # Hide weekends to avoid gaps
-    fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
+    if not is_monthly:
+        # Hide weekends on daily charts (month-ends can fall on Sat/Sun so skip for monthly charts)
+        fig.update_xaxes(rangebreaks=[dict(bounds=["sat", "mon"])])
     return fig
 
 
 def _render_evidence_chart(services: AppServices, signal: Signal, order_price: Optional[float]) -> None:
+    lookback = MONTHLY_CHART_LOOKBACK_DAYS if signal.algo_id in MONTHLY_TREND_ALGO_IDS else CHART_LOOKBACK_DAYS
     try:
         df = services.data_provider.get_daily_ohlcv(
             signal.symbol,
             market=signal.market.value,
-            lookback_days=CHART_LOOKBACK_DAYS,
+            lookback_days=lookback,
             include_live_quote=True,
         )
     except Exception as exc:  # chart is evidence only; never block the order flow
