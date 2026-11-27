@@ -72,6 +72,16 @@ def _extract_users_map(raw_secrets: Dict[str, Any]) -> Dict[str, Dict[str, Any]]
     }
 
 
+def find_duplicate_sheet_ids(users: Dict[str, Dict[str, Any]]) -> Dict[str, list[str]]:
+    """Return mapping of sheet_id -> list of user keys when multiple users share the same SHEET_ID."""
+    by_sheet: Dict[str, list[str]] = {}
+    for user_key, cfg in users.items():
+        sid = str(cfg.get("SHEET_ID", "")).strip()
+        if sid:
+            by_sheet.setdefault(sid, []).append(user_key)
+    return {sid: uids for sid, uids in by_sheet.items() if len(uids) > 1}
+
+
 def _find_matching_user_key(users: Dict[str, Dict[str, Any]], login_id: str) -> Optional[str]:
     cleaned = login_id.strip()
     if not cleaned:
@@ -175,6 +185,14 @@ def get_app_services() -> AppServices:
     users = _extract_users_map(raw_secrets)
 
     if users:
+        dups = find_duplicate_sheet_ids(users)
+        if dups:
+            details = ", ".join(f"`{sid}` ({', '.join(uids)})" for sid, uids in dups.items())
+            st.error(
+                f"🚨 멀티유저 설정 오류: 서로 다른 사용자에게 동일한 `SHEET_ID`가 중복 설정되어 있습니다: {details}. "
+                "사용자별 독립 Google Sheet ID를 설정한 뒤 다시 시도해 주세요."
+            )
+            st.stop()
         effective_secrets = _authenticate_multi_user(raw_secrets, users)
     else:
         _authenticate_single_user(raw_secrets)
@@ -192,12 +210,18 @@ def get_app_services() -> AppServices:
     ctx = load_user_context_from_mapping(effective_secrets)
 
     offline_demo = False
-    if ctx.sheet_id and ctx.credentials.gcp_service_account:
+    if ctx.sheet_id and not ctx.credentials.gcp_service_account:
+        st.error(
+            "🚨 설정 오류: `SHEET_ID`는 설정되어 있으나 GCP 서비스 계정 키(`gcp_service_account` 또는 "
+            "`GCP_SERVICE_ACCOUNT_JSON`)가 없습니다. 메모리 백엔드로 주문 이력이 유실되는 것을 방지하기 위해 실행을 중단합니다."
+        )
+        st.stop()
+    elif ctx.sheet_id and ctx.credentials.gcp_service_account:
         sheet = UserSheetManager(ctx)
+        sheet.flush_pending_writes()
     else:
-        # Local/demo fallback without GCP service account
-        if not ctx.sheet_id:
-            ctx.sheet_id = f"local_sheet_{ctx.safe_user_id}"
+        # Local/demo fallback when SHEET_ID is intentionally omitted
+        ctx.sheet_id = f"local_sheet_{ctx.safe_user_id}"
         sheet = UserSheetManager(ctx, backend=InMemorySheetBackend(ctx.sheet_id))
         offline_demo = True
 

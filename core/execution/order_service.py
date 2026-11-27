@@ -10,7 +10,46 @@ from typing import Any, Dict, List, Optional
 
 from core.algorithms.base import Signal, SignalAction
 from core.context import ExecutionMode, UserContext
+from core.kis.client import MockKISClient
 from core.ledger.calculator import allocate_sell_across_lots, apply_fills_to_lot
+
+# Default estimated brokerage commission & securities transaction tax rates
+DEFAULT_KR_FEE_RATE = 0.00015   # 0.015% KIS online KR commission
+DEFAULT_KR_SELL_TAX_RATE = 0.0018  # 0.18% KR securities transaction tax (sell only)
+DEFAULT_US_FEE_RATE = 0.0025    # 0.25% KIS standard US commission
+DEFAULT_US_SELL_TAX_RATE = 0.0
+
+
+def _order_no_matches(row_order_no: Any, target_order_no: str) -> bool:
+    a = str(row_order_no or "").strip()
+    b = str(target_order_no or "").strip()
+    if not a or not b:
+        return False
+    return a == b or (a.lstrip("0") == b.lstrip("0") and a.lstrip("0") != "")
+
+
+def _estimate_fee_and_tax(
+    market: str,
+    side: FillSide,
+    qty: int,
+    price: float,
+    matched_row: Optional[Dict[str, Any]] = None,
+) -> tuple[float, float]:
+    gross = max(0, int(qty)) * float(price)
+    if matched_row is not None:
+        raw_fee = matched_row.get("fee")
+        raw_tax = matched_row.get("tax")
+        if raw_fee is not None or raw_tax is not None:
+            return round(float(raw_fee or 0.0), 4), round(float(raw_tax or 0.0), 4)
+
+    mkt = market.upper()
+    if mkt == "KR":
+        fee = round(gross * DEFAULT_KR_FEE_RATE, 2)
+        tax = round(gross * DEFAULT_KR_SELL_TAX_RATE, 2) if side == FillSide.SELL else 0.0
+        return fee, tax
+    fee = round(gross * DEFAULT_US_FEE_RATE, 4)
+    tax = round(gross * DEFAULT_US_SELL_TAX_RATE, 4) if side == FillSide.SELL else 0.0
+    return fee, tax
 from core.ledger.models import (
     AuditRecord,
     Fill,
@@ -104,7 +143,16 @@ class OrderService:
             self.notifier.notify_signal(signal, status_label="승인대기(반자동)")
             return ExecutionOutcome(False, "PROPOSED", "반자동 모드: 사용자 확인 대기")
 
-        # 3. Place broker order
+        # 3. Block live broker orders when sheet backend is non-persistent (InMemorySheetBackend)
+        if getattr(self.sheet, "is_in_memory", False) and not isinstance(self.kis, MockKISClient):
+            msg = "영구 Google Sheet(GCP 서비스 계정)가 연결되지 않아 실/모의 KIS 주문을 차단했습니다."
+            self._record_signal(signal, "BLOCKED_NO_SHEET")
+            self.sheet.append_audit(
+                AuditRecord(utc_now_iso(), self.ctx.user_id, "ORDER_BLOCKED_NO_SHEET", msg)
+            )
+            return ExecutionOutcome(False, "BLOCKED_NO_SHEET", msg)
+
+        # 4. Place broker order
         qty = int(signal.qty or 0)
         if qty <= 0:
             return ExecutionOutcome(False, "ORDER_FAILED", "주문 수량이 0 이하입니다.")
@@ -123,29 +171,50 @@ class OrderService:
             self.notifier.notify_error(f"{signal.action.value} {signal.symbol}", msg)
             return ExecutionOutcome(False, "ORDER_FAILED", msg)
 
-        order_no = str(order_res.get("order_no", ""))
+        order_no = str(order_res.get("order_no", "")).strip()
 
-        # 4. Confirm filled quantity via inquire_ccnl (R5.5)
-        filled_qty = qty
+        # 5. Confirm filled quantity via inquire_ccnl (R5.5) — never assume filled when unmatched
+        matched_row: Optional[Dict[str, Any]] = None
         filled_price = float(signal.price)
         if hasattr(self.kis, "inquire_ccnl"):
-            ccnl_rows = self.kis.inquire_ccnl(order_no=order_no, market=signal.market.value)
-            matched = [r for r in ccnl_rows if r.get("order_no") == order_no]
+            filled_qty = 0
+            try:
+                ccnl_rows = self.kis.inquire_ccnl(order_no=order_no, market=signal.market.value)
+            except Exception as exc:
+                msg = f"체결 조회 실패로 미체결 보류 (order_no={order_no}): {exc}"
+                self._record_signal(signal, "UNFILLED")
+                self.sheet.append_audit(
+                    AuditRecord(utc_now_iso(), self.ctx.user_id, "ORDER_CCNL_ERROR", msg)
+                )
+                return ExecutionOutcome(False, "UNFILLED", msg, order_no=order_no)
+            matched = [r for r in ccnl_rows if _order_no_matches(r.get("order_no"), order_no)]
             if matched:
-                filled_qty = int(matched[0].get("filled_qty", 0) or 0)
-                if float(matched[0].get("avg_price", 0) or 0) > 0:
-                    filled_price = float(matched[0]["avg_price"])
+                matched_row = matched[0]
+                filled_qty = int(matched_row.get("filled_qty", 0) or 0)
+                if float(matched_row.get("avg_price", 0) or 0) > 0:
+                    filled_price = float(matched_row["avg_price"])
+        else:
+            filled_qty = qty
 
         if filled_qty <= 0:
             self._record_signal(signal, "UNFILLED")
-            return ExecutionOutcome(False, "UNFILLED", f"미체결 (order_no={order_no})", order_no=order_no)
+            self.sheet.append_audit(
+                AuditRecord(
+                    utc_now_iso(),
+                    self.ctx.user_id,
+                    "ORDER_UNFILLED",
+                    f"order_no={order_no}, {signal.action.value} {signal.symbol} req_qty={qty} (체결 미확인)",
+                )
+            )
+            return ExecutionOutcome(False, "UNFILLED", f"미체결 또는 체결 미확인 (order_no={order_no})", order_no=order_no)
 
-        # 5. Update append-only Fills and Lots in personal Sheet
+        # 6. Update append-only Fills and row-level Lots in personal Sheet
         today_str = date.today().strftime("%Y-%m-%d")
         all_lots = self.sheet.load_lots(use_cache=False)
         all_fills = self.sheet.load_fills(use_cache=False)
         new_fills: List[Fill] = []
         touched_lots: List[Lot] = []
+        unallocated_qty = 0
 
         if signal.action == SignalAction.BUY:
             target_lot = self._find_target_buy_lot(signal, all_lots)
@@ -168,6 +237,7 @@ class OrderService:
             else:
                 target_lot.algo_state = self._next_algo_state(target_lot.algo_state, signal)
 
+            fee, tax = _estimate_fee_and_tax(signal.market.value, FillSide.BUY, filled_qty, filled_price, matched_row)
             fill = Fill(
                 fill_id=generate_id("fill"),
                 lot_id=target_lot.lot_id,
@@ -175,6 +245,8 @@ class OrderService:
                 date=today_str,
                 qty=filled_qty,
                 price=filled_price,
+                fee=fee,
+                tax=tax,
                 order_no=order_no,
                 note=signal.reason_text,
             )
@@ -189,11 +261,27 @@ class OrderService:
                 preferred_algo_id=signal.algo_id,
                 preferred_lot_id=signal.lot_id,
             )
+            allocated_qty = sum(q for _, q in allocations)
+            unallocated_qty = max(0, filled_qty - allocated_qty)
+            if unallocated_qty > 0:
+                mismatch_detail = (
+                    f"order_no={order_no}, symbol={signal.symbol}, filled_qty={filled_qty}, "
+                    f"allocated_qty={allocated_qty}, unallocated_qty={unallocated_qty}"
+                )
+                self.sheet.append_audit(
+                    AuditRecord(utc_now_iso(), self.ctx.user_id, "SELL_ALLOCATION_MISMATCH", mismatch_detail)
+                )
+                self.notifier.notify_error(
+                    f"매도 Lot 배분 불일치 ({signal.symbol})",
+                    f"체결 {filled_qty}주 중 {allocated_qty}주만 원장에 반영됨 (미배분 {unallocated_qty}주, order_no={order_no})",
+                )
+
             lot_by_id = {l.lot_id: l for l in all_lots}
             for alloc_lot_id, alloc_qty in allocations:
                 lot_obj = lot_by_id[alloc_lot_id]
                 if "next_exit_stage" in signal.metadata:
                     lot_obj.algo_state["exit_stage"] = int(signal.metadata["next_exit_stage"])
+                fee, tax = _estimate_fee_and_tax(signal.market.value, FillSide.SELL, alloc_qty, filled_price, matched_row)
                 fill = Fill(
                     fill_id=generate_id("fill"),
                     lot_id=alloc_lot_id,
@@ -201,6 +289,8 @@ class OrderService:
                     date=today_str,
                     qty=alloc_qty,
                     price=filled_price,
+                    fee=fee,
+                    tax=tax,
                     order_no=order_no,
                     note="risk_override" if is_risk_override else signal.reason_text,
                 )
@@ -208,11 +298,22 @@ class OrderService:
                 synced_lot = apply_fills_to_lot(lot_obj, all_fills + new_fills)
                 touched_lots.append(synced_lot)
 
-        self.sheet.append_fills(new_fills)
-        if touched_lots:
-            self.sheet.upsert_lots(touched_lots)
+        if new_fills:
+            fills_written = self.sheet.append_fills(new_fills)
+            if touched_lots:
+                # Keep Lots strictly ordered behind Fills if append_fills fell back to local queue
+                self.sheet.upsert_lots(touched_lots, queue_only=not fills_written)
 
-        decision_tag = "RISK_OVERRIDE" if is_risk_override else "EXECUTED"
+        if signal.action == SignalAction.SELL and unallocated_qty == filled_qty:
+            decision_tag = "UNALLOCATED"
+            msg = f"체결({filled_qty}주 @ {filled_price:,.2f})되었으나 배분할 OPEN Lot이 없어 원장 미반영"
+        elif signal.action == SignalAction.SELL and unallocated_qty > 0:
+            decision_tag = "PARTIAL_ALLOC"
+            msg = f"체결 완료 ({filled_qty}주 @ {filled_price:,.2f}, 미배분 {unallocated_qty}주 확인 필요)"
+        else:
+            decision_tag = "RISK_OVERRIDE" if is_risk_override else "EXECUTED"
+            msg = f"체결 완료 ({filled_qty}주 @ {filled_price:,.2f})"
+
         self._record_signal(signal, decision_tag)
         self.sheet.append_audit(
             AuditRecord(
@@ -225,11 +326,11 @@ class OrderService:
                 ),
             )
         )
-        self.notifier.notify_signal(signal, status_label="체결완료")
+        self.notifier.notify_signal(signal, status_label="체결완료" if unallocated_qty == 0 else f"체결(미배분 {unallocated_qty}주)")
         return ExecutionOutcome(
             executed=True,
             decision=decision_tag,
-            message=f"체결 완료 ({filled_qty}주 @ {filled_price:,.2f})",
+            message=msg,
             order_no=order_no,
             filled_qty=filled_qty,
             lot_ids=[l.lot_id for l in touched_lots],

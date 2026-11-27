@@ -4,6 +4,7 @@ Append-only Fill ledger calculator and multi-lot sell allocator (R2.2, R5.4, R5.
 from __future__ import annotations
 
 from datetime import date, datetime
+import re
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from core.ledger.models import (
@@ -19,12 +20,21 @@ from core.ledger.models import (
 def _parse_date(date_str: str) -> Optional[date]:
     if not date_str:
         return None
-    cleaned = str(date_str).strip()[:10].replace(".", "-").replace("/", "-")
-    for fmt in ("%Y-%m-%d", "%Y%m%d"):
+    raw = str(date_str).strip()
+    # Supports ISO ("2026-11-27", "2026-11-27T..."), slash ("2026/11/27"),
+    # and Korean Google Sheets locale ("2026. 11. 27" / "2026. 11. 27.")
+    m = re.match(r"^(\d{4})\s*[-./]\s*(\d{1,2})\s*[-./]\s*(\d{1,2})", raw)
+    if m:
         try:
-            return datetime.strptime(cleaned, fmt).date()
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
         except ValueError:
-            continue
+            return None
+    m_compact = re.match(r"^(\d{4})(\d{2})(\d{2})$", raw)
+    if m_compact:
+        try:
+            return date(int(m_compact.group(1)), int(m_compact.group(2)), int(m_compact.group(3)))
+        except ValueError:
+            return None
     return None
 
 

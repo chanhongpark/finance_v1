@@ -29,11 +29,25 @@ class SheetQuotaError(RuntimeError):
     """Raised when Google Sheets API returns 429 / quota exceeded."""
 
 
+def _col_letter(col_idx: int) -> str:
+    """Convert 1-based column index to A1 column letter (1 -> 'A', 27 -> 'AA')."""
+    result = []
+    n = max(1, int(col_idx))
+    while n > 0:
+        n, rem = divmod(n - 1, 26)
+        result.append(chr(ord("A") + rem))
+    return "".join(reversed(result))
+
+
 class SheetBackend(ABC):
     """Abstract worksheet backend for GSpread or in-memory testing."""
 
     @abstractmethod
     def ensure_worksheet(self, tab_name: str, headers: List[str]) -> None:
+        pass
+
+    @abstractmethod
+    def get_headers(self, tab_name: str) -> List[str]:
         pass
 
     @abstractmethod
@@ -46,6 +60,10 @@ class SheetBackend(ABC):
 
     @abstractmethod
     def overwrite_table(self, tab_name: str, headers: List[str], rows: List[List[Any]]) -> None:
+        pass
+
+    @abstractmethod
+    def upsert_rows_by_key(self, tab_name: str, key_col: str, records: List[Dict[str, Any]]) -> None:
         pass
 
 
@@ -69,6 +87,9 @@ class InMemorySheetBackend(SheetBackend):
                     for col in missing:
                         row.setdefault(col, "")
 
+    def get_headers(self, tab_name: str) -> List[str]:
+        return list(self.headers.get(tab_name, []))
+
     def read_records(self, tab_name: str) -> List[Dict[str, Any]]:
         return [dict(r) for r in self.tables.get(tab_name, [])]
 
@@ -88,6 +109,23 @@ class InMemorySheetBackend(SheetBackend):
             for r in rows
         ]
 
+    def upsert_rows_by_key(self, tab_name: str, key_col: str, records: List[Dict[str, Any]]) -> None:
+        if not records:
+            return
+        headers = self.headers[tab_name]
+        table = self.tables.setdefault(tab_name, [])
+        index_by_key = {str(r.get(key_col, "")): idx for idx, r in enumerate(table)}
+        for rec in records:
+            key = str(rec.get(key_col, ""))
+            if not key:
+                continue
+            row_dict = {col: rec.get(col, "") for col in headers}
+            if key in index_by_key:
+                table[index_by_key[key]] = row_dict
+            else:
+                index_by_key[key] = len(table)
+                table.append(row_dict)
+
 
 class GSpreadBackend(SheetBackend):
     """Production Google Sheets backend via gspread + google-auth."""
@@ -104,6 +142,7 @@ class GSpreadBackend(SheetBackend):
         self._client = gspread.authorize(creds)
         self._spreadsheet = self._client.open_by_key(sheet_id)
         self._ws_cache: Dict[str, Any] = {}
+        self._headers_cache: Dict[str, List[str]] = {}
 
     def _call_with_retry(self, fn: Any, *args: Any, **kwargs: Any) -> Any:
         delays = [1.0, 2.0, 4.0]
@@ -133,12 +172,16 @@ class GSpreadBackend(SheetBackend):
             ws = self._get_ws(tab_name)
             existing = self._call_with_retry(ws.row_values, 1)
             if not existing:
-                self._call_with_retry(ws.update, "A1", [headers])
+                self._call_with_retry(ws.update, "A1", [headers], value_input_option="RAW")
+                self._headers_cache[tab_name] = list(headers)
             else:
                 missing = compute_missing_columns(tab_name, existing)
                 if missing:
                     new_headers = existing + missing
-                    self._call_with_retry(ws.update, "A1", [new_headers])
+                    self._call_with_retry(ws.update, "A1", [new_headers], value_input_option="RAW")
+                    self._headers_cache[tab_name] = list(new_headers)
+                else:
+                    self._headers_cache[tab_name] = list(existing)
         except gspread.WorksheetNotFound:
             ws = self._call_with_retry(
                 self._spreadsheet.add_worksheet,
@@ -147,23 +190,74 @@ class GSpreadBackend(SheetBackend):
                 cols=max(len(headers) + 2, 10),
             )
             self._ws_cache[tab_name] = ws
-            self._call_with_retry(ws.update, "A1", [headers])
+            self._call_with_retry(ws.update, "A1", [headers], value_input_option="RAW")
+            self._headers_cache[tab_name] = list(headers)
+
+    def get_headers(self, tab_name: str) -> List[str]:
+        if tab_name not in self._headers_cache or not self._headers_cache[tab_name]:
+            ws = self._get_ws(tab_name)
+            self._headers_cache[tab_name] = list(self._call_with_retry(ws.row_values, 1))
+        return list(self._headers_cache[tab_name])
 
     def read_records(self, tab_name: str) -> List[Dict[str, Any]]:
         ws = self._get_ws(tab_name)
-        return self._call_with_retry(ws.get_all_records)
+        # Preserve leading zeros (KR symbols like "005930", order_no) and ISO date strings
+        return self._call_with_retry(ws.get_all_records, numericise_ignore=["all"])
 
     def append_rows(self, tab_name: str, rows: List[List[Any]]) -> None:
         if not rows:
             return
         ws = self._get_ws(tab_name)
-        self._call_with_retry(ws.append_rows, rows, value_input_option="USER_ENTERED")
+        # Use RAW so "005930", "2026-11-27", and notes starting with =/+/- are stored verbatim
+        self._call_with_retry(ws.append_rows, rows, value_input_option="RAW")
 
     def overwrite_table(self, tab_name: str, headers: List[str], rows: List[List[Any]]) -> None:
         ws = self._get_ws(tab_name)
-        self._call_with_retry(ws.clear)
+        prev_row_count = len(self._call_with_retry(ws.col_values, 1))
         payload = [headers] + rows
-        self._call_with_retry(ws.update, "A1", payload, value_input_option="USER_ENTERED")
+        # Overwrite in place first without clearing, so a mid-write failure never wipes the tab
+        self._call_with_retry(ws.update, "A1", payload, value_input_option="RAW")
+        self._headers_cache[tab_name] = list(headers)
+        if prev_row_count > len(payload):
+            end_col = _col_letter(max(len(headers), 1))
+            trailing_range = f"A{len(payload) + 1}:{end_col}{prev_row_count}"
+            self._call_with_retry(ws.batch_clear, [trailing_range])
+
+    def upsert_rows_by_key(self, tab_name: str, key_col: str, records: List[Dict[str, Any]]) -> None:
+        if not records:
+            return
+        ws = self._get_ws(tab_name)
+        headers = self.get_headers(tab_name)
+        if key_col not in headers:
+            raise ValueError(f"Key column '{key_col}' not found in worksheet '{tab_name}' headers: {headers}")
+        key_col_idx = headers.index(key_col) + 1
+        existing_keys = self._call_with_retry(ws.col_values, key_col_idx)
+        # Row 1 is header; data rows start at row 2
+        row_num_by_key: Dict[str, int] = {}
+        for row_idx, val in enumerate(existing_keys[1:], start=2):
+            val_str = str(val).strip()
+            if val_str:
+                row_num_by_key[val_str] = row_idx
+
+        end_col = _col_letter(len(headers))
+        batch_updates: List[Dict[str, Any]] = []
+        to_append: List[List[Any]] = []
+
+        for rec in records:
+            key = str(rec.get(key_col, "")).strip()
+            if not key:
+                continue
+            row_vals = [rec.get(col, "") for col in headers]
+            if key in row_num_by_key:
+                row_num = row_num_by_key[key]
+                batch_updates.append({"range": f"A{row_num}:{end_col}{row_num}", "values": [row_vals]})
+            else:
+                to_append.append(row_vals)
+
+        if batch_updates:
+            self._call_with_retry(ws.batch_update, batch_updates, value_input_option="RAW")
+        if to_append:
+            self._call_with_retry(ws.append_rows, to_append, value_input_option="RAW")
 
 
 class UserSheetManager:
@@ -197,6 +291,10 @@ class UserSheetManager:
 
         self.ensure_schema()
 
+    @property
+    def is_in_memory(self) -> bool:
+        return isinstance(self._backend, InMemorySheetBackend)
+
     def ensure_schema(self) -> None:
         """Verify all 6 required tabs and schema_version on startup (R2.1)."""
         for tab_name, headers in SHEET_SCHEMAS.items():
@@ -222,14 +320,16 @@ class UserSheetManager:
         self._read_cache[tab_name] = (now, [dict(r) for r in records])
         return records
 
-    def _enqueue_failed_write(self, op: str, tab_name: str, payload: Any) -> None:
+    def _enqueue_failed_write(self, op: str, tab_name: str, payload: Any, **extra: Any) -> None:
         queue: List[Dict[str, Any]] = []
         if self._pending_queue_path.exists():
             try:
                 queue = json.loads(self._pending_queue_path.read_text(encoding="utf-8"))
             except Exception:
                 queue = []
-        queue.append({"ts": utc_now_iso(), "op": op, "tab": tab_name, "payload": payload})
+        entry: Dict[str, Any] = {"ts": utc_now_iso(), "op": op, "tab": tab_name, "payload": payload}
+        entry.update(extra)
+        queue.append(entry)
         self._pending_queue_path.write_text(json.dumps(queue, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def flush_pending_writes(self) -> int:
@@ -247,28 +347,55 @@ class UserSheetManager:
         flushed = 0
         for item in queue:
             try:
-                if item["op"] == "append_rows":
-                    self._backend.append_rows(item["tab"], item["payload"])
-                    self.invalidate_cache(item["tab"])
+                op = item.get("op")
+                tab = item["tab"]
+                if op == "append_rows":
+                    payload = item["payload"]
+                    if payload and isinstance(payload[0], dict):
+                        headers = self._backend.get_headers(tab) or SHEET_SCHEMAS[tab]
+                        rows = [[d.get(col, "") for col in headers] for d in payload]
+                    else:
+                        rows = payload
+                    self._backend.append_rows(tab, rows)
+                    self.invalidate_cache(tab)
+                    flushed += 1
+                elif op == "upsert_rows":
+                    key_col = str(item.get("key_col", "lot_id"))
+                    self._backend.upsert_rows_by_key(tab, key_col, item["payload"])
+                    self.invalidate_cache(tab)
                     flushed += 1
             except Exception as exc:
-                logger.warning("Failed to flush pending write for %s: %s", item["tab"], exc)
+                logger.warning("Failed to flush pending write for %s: %s", item.get("tab"), exc)
                 remaining.append(item)
 
         self._pending_queue_path.write_text(json.dumps(remaining, ensure_ascii=False, indent=2), encoding="utf-8")
         return flushed
 
-    def _safe_append(self, tab_name: str, dicts: List[Dict[str, Any]]) -> None:
+    def _safe_append(self, tab_name: str, dicts: List[Dict[str, Any]]) -> bool:
         if not dicts:
-            return
-        headers = SHEET_SCHEMAS[tab_name]
+            return True
+        headers = self._backend.get_headers(tab_name) or SHEET_SCHEMAS[tab_name]
         rows = [[d.get(col, "") for col in headers] for d in dicts]
         try:
             self._backend.append_rows(tab_name, rows)
             self.invalidate_cache(tab_name)
+            return True
         except Exception as exc:
             logger.error("Sheet append failed for %s (%s); queuing locally", tab_name, exc)
-            self._enqueue_failed_write("append_rows", tab_name, rows)
+            self._enqueue_failed_write("append_rows", tab_name, dicts)
+            return False
+
+    def _safe_upsert(self, tab_name: str, key_col: str, dicts: List[Dict[str, Any]]) -> bool:
+        if not dicts:
+            return True
+        try:
+            self._backend.upsert_rows_by_key(tab_name, key_col, dicts)
+            self.invalidate_cache(tab_name)
+            return True
+        except Exception as exc:
+            logger.error("Sheet upsert failed for %s (%s); queuing locally", tab_name, exc)
+            self._enqueue_failed_write("upsert_rows", tab_name, dicts, key_col=key_col)
+            return False
 
     # ------------------------------------------------------------------
     # Settings
@@ -342,26 +469,28 @@ class UserSheetManager:
         return [Lot.from_sheet_row(r) for r in rows if r.get("lot_id")]
 
     def save_lots(self, lots: List[Lot]) -> None:
-        headers = SHEET_SCHEMAS["Lots"]
+        headers = self._backend.get_headers("Lots") or SHEET_SCHEMAS["Lots"]
         rows = [[lot.to_sheet_row().get(col, "") for col in headers] for lot in lots]
         self._backend.overwrite_table("Lots", headers, rows)
         self.invalidate_cache("Lots")
 
-    def upsert_lots(self, updated_lots: List[Lot]) -> List[Lot]:
-        existing = {lot.lot_id: lot for lot in self.load_lots(use_cache=False)}
-        for lot in updated_lots:
-            existing[lot.lot_id] = lot
-        merged = sorted(existing.values(), key=lambda x: (x.buy_date, x.lot_id))
-        self.save_lots(merged)
-        return merged
+    def upsert_lots(self, updated_lots: List[Lot], queue_only: bool = False) -> List[Lot]:
+        """Row-level upsert by lot_id to avoid full-table overwrite and lost updates."""
+        dicts = [lot.to_sheet_row() for lot in updated_lots]
+        if dicts:
+            if queue_only:
+                self._enqueue_failed_write("upsert_rows", "Lots", dicts, key_col="lot_id")
+            else:
+                self._safe_upsert("Lots", "lot_id", dicts)
+        return self.load_lots(use_cache=False)
 
     def load_fills(self, use_cache: bool = True) -> List[Fill]:
         rows = self._read_tab("Fills", use_cache=use_cache)
         return [Fill.from_sheet_row(r) for r in rows if r.get("fill_id")]
 
-    def append_fills(self, fills: List[Fill]) -> None:
-        """Append-only ledger write (R2.2)."""
-        self._safe_append("Fills", [f.to_sheet_row() for f in fills])
+    def append_fills(self, fills: List[Fill]) -> bool:
+        """Append-only ledger write (R2.2). Returns True if written immediately, False if queued."""
+        return self._safe_append("Fills", [f.to_sheet_row() for f in fills])
 
     # ------------------------------------------------------------------
     # Signals & Audit (Append-only)

@@ -80,13 +80,17 @@ class Lot:
 
         status_raw = str(row.get("status", LotStatus.OPEN.value)).upper()
         status = LotStatus(status_raw) if status_raw in {"OPEN", "CLOSED"} else LotStatus.OPEN
+        market = str(row.get("market", "KR")).strip().upper()
+        raw_symbol = str(row.get("symbol", "")).strip()
+        if market == "KR" and raw_symbol.isdigit() and len(raw_symbol) < 6:
+            raw_symbol = raw_symbol.zfill(6)
         return cls(
-            lot_id=str(row.get("lot_id", "")),
-            symbol=str(row.get("symbol", "")),
-            market=str(row.get("market", "KR")).upper(),
-            algo_id=str(row.get("algo_id", "manual")),
-            algo_version=str(row.get("algo_version", "1.0.0")),
-            buy_date=str(row.get("buy_date", "")),
+            lot_id=str(row.get("lot_id", "")).strip(),
+            symbol=raw_symbol,
+            market=market,
+            algo_id=str(row.get("algo_id", "manual")).strip(),
+            algo_version=str(row.get("algo_version", "1.0.0")).strip(),
+            buy_date=str(row.get("buy_date", "")).strip(),
             qty=int(float(row.get("qty", 0) or 0)),
             avg_price=float(row.get("avg_price", 0.0) or 0.0),
             status=status,

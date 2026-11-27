@@ -21,6 +21,7 @@ from plotly.subplots import make_subplots
 from core.algorithms.base import PRICE_TYPE_HELP, SUPPORTED_PRICE_TYPES, PriceType, Signal, SignalAction
 from core.execution.order_service import OrderService
 from core.indicators import calculate_technical_indicators, resample_to_monthly
+from core.kis.client import MockKISClient
 from ui.auth import AppServices
 
 CHART_LOOKBACK_DAYS = 200
@@ -429,11 +430,18 @@ def open_order_confirmation_dialog(services: AppServices, signal: Signal) -> Non
                 st.write(f"- {c.format_badge()} — {c.desc}")
 
     st.divider()
+    live_kis_without_sheet = services.sheet.is_in_memory and not isinstance(services.kis, MockKISClient)
+    if live_kis_without_sheet:
+        st.error(
+            "🚨 영구 Google Sheet(GCP 서비스 계정)가 연결되지 않은 메모리 백엔드 상태에서는 "
+            "KIS 주문을 실행할 수 없습니다. Secrets 설정을 확인해 주세요."
+        )
+
     c_cancel, c_ok = st.columns(2)
     if c_cancel.button("취소", width="stretch"):
         st.rerun()
 
-    if c_ok.button("확인 후 주문 실행", type="primary", width="stretch", disabled=qty <= 0):
+    if c_ok.button("확인 후 주문 실행", type="primary", width="stretch", disabled=qty <= 0 or live_kis_without_sheet):
         final_signal = dataclasses.replace(
             signal,
             qty=qty,

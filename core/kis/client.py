@@ -349,7 +349,7 @@ class KISClient:
                 "SLL_BUY_DVSN_CD": "00",
                 "INQR_DVSN": "00",
                 "PDNO": "",
-                "CCLD_DVSN": "01",
+                "CCLD_DVSN": "00",
                 "ORD_GNO_BRNO": "",
                 "ODNO": order_no,
                 "INQR_DVSN_3": "00",
@@ -362,15 +362,46 @@ class KISClient:
             rows = resp.json().get("output1", [])
             return [
                 {
-                    "order_no": str(r.get("odno", "")),
-                    "symbol": str(r.get("pdno", "")),
+                    "order_no": str(r.get("odno", "")).strip(),
+                    "symbol": str(r.get("pdno", "")).strip(),
                     "filled_qty": int(float(r.get("tot_ccld_qty", 0) or 0)),
                     "unfilled_qty": int(float(r.get("rmn_qty", 0) or 0)),
                     "avg_price": float(r.get("avg_prvs", 0) or 0),
                 }
                 for r in rows
             ]
-        return []
+        # US overseas stock execution inquiry
+        tr_id = "VTTS3035R" if self.ctx.is_mock else "TTTS3035R"
+        url = f"{self.base_url}/uapi/overseas-stock/v1/trading/inquire-ccnl"
+        params = {
+            "CANO": self.ctx.credentials.account_prefix,
+            "ACNT_PRDT_CD": self.ctx.credentials.account_suffix,
+            "PDNO": "",
+            "ORD_STRT_DT": today_str,
+            "ORD_END_DT": today_str,
+            "SLL_BUY_DVSN": "00",
+            "CCLD_NCCS_DVSN": "00",
+            "OVRS_EXCG_CD": "",
+            "SORT_SQN": "DS",
+            "ORD_DT": "",
+            "ORD_GNO_BRNO": "",
+            "ODNO": order_no,
+            "CTX_AREA_NK200": "",
+            "CTX_AREA_FK200": "",
+        }
+        resp = requests.get(url, headers=self._headers(tr_id), params=params, timeout=self.timeout)
+        resp.raise_for_status()
+        rows = resp.json().get("output", [])
+        return [
+            {
+                "order_no": str(r.get("odno", "")).strip(),
+                "symbol": str(r.get("pdno", "")).strip().upper(),
+                "filled_qty": int(float(r.get("ft_ccld_qty", 0) or 0)),
+                "unfilled_qty": int(float(r.get("nccs_qty", 0) or 0)),
+                "avg_price": float(r.get("ft_ccld_unpr3", 0) or 0),
+            }
+            for r in rows
+        ]
 
 
 class MockKISClient:
