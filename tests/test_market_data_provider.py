@@ -291,3 +291,82 @@ def test_holiday_cooldown_and_kr_symbol_normalization_and_post_close_gap(tmp_pat
     df_past = provider.get_daily_ohlcv("005930", market="KR", lookback_days=30, as_of=date(2026, 11, 13))
     assert df_past["date"].iloc[-1] == "2026-11-13"
 
+
+
+def test_split_refetch_failure_preserves_cache_and_retries_cleanly(tmp_path: Path) -> None:
+    mode = "pre_split"
+    call_num = 0
+
+    def fake_fdr(symbol: str, start: str, end: str) -> pd.DataFrame:
+        nonlocal call_num
+        call_num += 1
+        if mode == "pre_split":
+            return _make_bars(date.fromisoformat(start), date.fromisoformat(end), close_price=100.0)
+        if mode == "fail_exc":
+            # Incremental call returns post-split (50.0); full refetch raises network error
+            if (date.fromisoformat(end) - date.fromisoformat(start)).days > 10:
+                raise RuntimeError("transient network error on full refetch")
+            return _make_bars(date.fromisoformat(start), date.fromisoformat(end), close_price=50.0)
+        if mode == "fail_empty":
+            # Incremental call returns post-split (50.0); full refetch returns empty
+            if (date.fromisoformat(end) - date.fromisoformat(start)).days > 10:
+                return pd.DataFrame()
+            return _make_bars(date.fromisoformat(start), date.fromisoformat(end), close_price=50.0)
+        # Recovery: full post-split history
+        return _make_bars(date.fromisoformat(start), date.fromisoformat(end), close_price=50.0)
+
+    cache = SharedMarketCache(tmp_path / "shared")
+    provider = HybridMarketDataProvider(cache=cache, fdr_reader=fake_fdr)
+
+    df0 = provider.get_daily_ohlcv("SOXL", market="US", lookback_days=60, as_of=date(2026, 11, 13))
+    orig_len = len(df0)
+    orig_meta = cache.load_ohlcv_meta("US", "SOXL")
+
+    # 1. Refetch raises exception -> cache must remain intact (no mixed 100/50 prices!) and meta unchanged
+    mode = "fail_exc"
+    df_exc = provider.get_daily_ohlcv("SOXL", market="US", lookback_days=60, as_of=date(2026, 11, 16))
+    disk_after_exc = cache.load_ohlcv("US", "SOXL")
+    assert len(disk_after_exc) == orig_len
+    assert all(float(c) == 100.0 for c in disk_after_exc["close"])
+    assert cache.load_ohlcv_meta("US", "SOXL") == orig_meta
+    assert all(float(c) == 100.0 for c in df_exc["close"])
+
+    # 2. Refetch returns empty -> cache must STILL remain intact (not overwritten with 4 incremental rows!)
+    mode = "fail_empty"
+    provider.get_daily_ohlcv("SOXL", market="US", lookback_days=60, as_of=date(2026, 11, 16))
+    disk_after_empty = cache.load_ohlcv("US", "SOXL")
+    assert len(disk_after_empty) == orig_len
+    assert all(float(c) == 100.0 for c in disk_after_empty["close"])
+    assert cache.load_ohlcv_meta("US", "SOXL") == orig_meta
+
+    # 3. Next call when FDR recovers -> detects split again and cleanly replaces entire cache with 50.0
+    mode = "recovered"
+    df_ok = provider.get_daily_ohlcv("SOXL", market="US", lookback_days=60, as_of=date(2026, 11, 16))
+    disk_after_ok = cache.load_ohlcv("US", "SOXL")
+    assert len(disk_after_ok) >= orig_len
+    assert len(df_ok) >= 40
+    assert all(float(c) == 50.0 for c in df_ok["close"])
+    assert all(float(c) == 50.0 for c in disk_after_ok["close"])
+
+
+def test_krx_special_holidays_and_suspended_stock_post_close_skip(tmp_path: Path) -> None:
+    from datetime import datetime
+    from core.market_calendar import KST, is_kr_market_holiday
+
+    # Labor Day (May 1) must be holiday even in 2024/2025; Dec 31 always holiday
+    assert is_kr_market_holiday(date(2024, 5, 1)) is True
+    assert is_kr_market_holiday(date(2025, 5, 1)) is True
+    assert is_kr_market_holiday(date(2025, 12, 31)) is True
+    # Constitution Day (Jul 17): open in 2025, holiday from 2026
+    assert is_kr_market_holiday(date(2025, 7, 17)) is False
+    assert is_kr_market_holiday(date(2026, 7, 17)) is True
+
+    # Post-close gap fill must skip suspended stock with volume == 0
+    cache = SharedMarketCache(tmp_path / "shared")
+    provider = HybridMarketDataProvider(cache=cache)
+    base_df = _make_bars(date(2026, 11, 10), date(2026, 11, 17), close_price=10_000.0)
+    suspended_quote = {"symbol": "005930", "price": 10_000.0, "open": 10_000.0, "high": 10_000.0, "low": 10_000.0, "volume": 0}
+    post_close_kst = datetime(2026, 11, 18, 16, 0, tzinfo=KST)
+    out = provider.stitch_live_quote_if_applicable(base_df, suspended_quote, market="KR", now=post_close_kst)
+    assert len(out) == len(base_df)
+    assert out["Date"].iloc[-1] == "2026-11-17"

@@ -5,13 +5,20 @@ from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta
 from functools import lru_cache
+import logging
 from typing import FrozenSet, Optional, Set
 from zoneinfo import ZoneInfo
+
+logger = logging.getLogger(__name__)
 
 try:
     import holidays as _holidays_lib
 except ImportError:  # pragma: no cover - fallback when holidays is not installed
     _holidays_lib = None
+    logger.warning(
+        "The 'holidays' package is not installed; falling back to minimal fixed holiday dates. "
+        "Run `pip install -r requirements.txt` for accurate KR/US market holiday calendars."
+    )
 
 KST = ZoneInfo("Asia/Seoul")
 US_EASTERN = ZoneInfo("America/New_York")
@@ -40,12 +47,13 @@ US_FIXED_MONTH_DAY: Set[tuple[int, int]] = {
 
 @lru_cache(maxsize=32)
 def _krx_holidays_for_year(year: int) -> FrozenSet[date]:
-    days: Set[date] = {date(year, 12, 31)}  # KRX year-end closing day
+    # KRX is always closed on Labor Day (May 1) and Year-End Closing Day (Dec 31)
+    days: Set[date] = {date(year, 5, 1), date(year, 12, 31)}
     if _holidays_lib is not None:
         kr = _holidays_lib.country_holidays("KR", years=year)
         for d in kr.keys():
-            # Constitution Day (Jul 17) is not a KRX trading holiday
-            if (d.month, d.day) == (7, 17):
+            # Constitution Day (Jul 17) was not a public/KRX holiday during 2008-2025
+            if 2008 <= year <= 2025 and (d.month, d.day) == (7, 17):
                 continue
             days.add(d)
     else:
