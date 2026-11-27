@@ -57,6 +57,14 @@ def render_history(services: AppServices) -> None:
         if signals:
             sig_df = pd.DataFrame(signals)
             if "symbol" in sig_df.columns:
+                def _normalize_sig_symbol(row: pd.Series) -> str:
+                    sym = str(row.get("symbol", "")).strip()
+                    algo_id = str(row.get("algo_id", "")).lower()
+                    is_kr = not algo_id.startswith("us_") and sym.isdigit()
+                    return sym.zfill(6) if (is_kr and len(sym) < 6) else sym
+
+                sig_df["symbol"] = sig_df.apply(_normalize_sig_symbol, axis=1)
+
                 def _resolve_sig_name(row: pd.Series) -> str:
                     sym = str(row.get("symbol", "")).strip()
                     algo_id = str(row.get("algo_id", "")).lower()

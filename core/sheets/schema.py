@@ -63,6 +63,25 @@ SHEET_SCHEMAS: Dict[str, List[str]] = {
         "action",
         "detail",
     ],
+    "PendingOrders": [
+        "order_no",
+        "symbol",
+        "market",
+        "algo_id",
+        "algo_version",
+        "side",
+        "req_qty",
+        "recorded_filled_qty",
+        "limit_price",
+        "lot_id",
+        "status",
+        "order_date",
+        "created_at",
+        "updated_at",
+        "metadata_json",
+        "conditions_json",
+        "reason_text",
+    ],
 }
 
 

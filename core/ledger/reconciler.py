@@ -34,6 +34,7 @@ class ReconciliationReport:
     created_manual_lots: List[Lot] = field(default_factory=list)
     created_fills: List[Fill] = field(default_factory=list)
     audits: List[AuditRecord] = field(default_factory=list)
+    skipped_reason: str = ""
 
 
 def reconcile_holdings(

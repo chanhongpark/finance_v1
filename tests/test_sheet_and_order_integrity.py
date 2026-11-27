@@ -9,9 +9,10 @@ from unittest.mock import MagicMock
 from core.algorithms import Market, PriceType, Signal, SignalAction
 from core.context import ExecutionMode, UserContext, UserCredentials, UserSettings
 from core.execution.order_service import OrderService
+from core.execution.runner import run_daily_reconciliation
 from core.kis.client import MockKISClient
-from core.ledger.calculator import _parse_date
-from core.ledger.models import Fill, FillSide, Lot, LotStatus
+from core.ledger.calculator import _parse_date, recalculate_lot_from_fills
+from core.ledger.models import Fill, FillSide, Lot, LotStatus, PendingOrderStatus
 from core.notifier.telegram import TelegramNotifier
 from core.sheets.schema import SHEET_SCHEMAS
 from core.sheets.user_sheet_manager import GSpreadBackend, InMemorySheetBackend, UserSheetManager
@@ -188,25 +189,190 @@ def test_append_maps_values_by_actual_worksheet_header_order(tmp_path: Path) -> 
     assert loaded[0].order_no == "00123"
 
 
-def test_unmatched_inquire_ccnl_does_not_mark_order_filled(tmp_path: Path) -> None:
-    """#9: If inquire_ccnl returns no matching execution, OrderService must return UNFILLED."""
+def test_unmatched_inquire_ccnl_saves_pending_order_and_settles_before_reconcile(tmp_path: Path) -> None:
+    """A & #9: Unfilled US LOC order is saved as SUBMITTED PendingOrder and settled before reconciliation."""
     ctx = _make_ctx(tmp_path)
     sheet = UserSheetManager(ctx, backend=InMemorySheetBackend(ctx.sheet_id))
     sheet.save_user_settings(ctx.settings)
 
-    class UnfilledMockKIS(MockKISClient):
-        def inquire_ccnl(self, order_no: str = "", market: str = "KR") -> List[Dict[str, Any]]:
-            return []
+    class DeferredFillMockKIS(MockKISClient):
+        def __init__(self, c: UserContext) -> None:
+            super().__init__(c)
+            self.fill_released = False
 
-    kis = UnfilledMockKIS(ctx)
+        def inquire_ccnl(self, order_no: str = "", market: str = "KR", lookback_days: int = 5) -> List[Dict[str, Any]]:
+            if not self.fill_released:
+                return []
+            return super().inquire_ccnl(order_no=order_no, market=market, lookback_days=lookback_days)
+
+    kis = DeferredFillMockKIS(ctx)
     svc = OrderService(ctx, sheet, kis, notifier=TelegramNotifier(ctx, dry_run=True))
-    sig = Signal(SignalAction.BUY, "kr_fujimoto_126", "1.0.0", "005930", Market.KR, PriceType.LIMIT, 70_000, qty=2)
+    sig = Signal(
+        SignalAction.BUY,
+        "us_infinite_buying",
+        "1.0.0",
+        "TQQQ",
+        Market.US,
+        PriceType.LOC,
+        50.0,
+        qty=4,
+        metadata={"round_inc": 0.5},
+    )
     out = svc.execute_signal(sig, user_confirmed=True)
 
     assert not out.executed
-    assert out.decision == "UNFILLED"
+    assert out.decision == "SUBMITTED"
     assert len(sheet.load_fills(use_cache=False)) == 0
     assert len(sheet.load_lots(use_cache=False)) == 0
+    pending = sheet.load_pending_orders(use_cache=False)
+    assert len(pending) == 1
+    assert pending[0].status == PendingOrderStatus.SUBMITTED
+
+    # Next day: KIS actually filled the LOC order and holds 4 shares of TQQQ
+    kis.fill_released = True
+    kis.holdings = [{"symbol": "TQQQ", "market": "US", "qty": 4, "avg_price": 50.0}]
+
+    report = run_daily_reconciliation(ctx, sheet, kis, markets=("US",))
+    assert report.is_matched
+    assert len(report.created_manual_lots) == 0
+
+    lots = sheet.load_lots(use_cache=False)
+    assert len(lots) == 1
+    assert lots[0].algo_id == "us_infinite_buying"
+    assert lots[0].qty == 4
+    assert lots[0].algo_state["current_round"] == 0.5
+    assert sheet.load_pending_orders(use_cache=False)[0].status == PendingOrderStatus.FILLED
+
+
+def test_partial_fill_settles_remainder_without_double_state_increment(tmp_path: Path) -> None:
+    """A: Partially filled order settles delta later without incrementing algo_state twice."""
+    ctx = _make_ctx(tmp_path)
+    sheet = UserSheetManager(ctx, backend=InMemorySheetBackend(ctx.sheet_id))
+    sheet.save_user_settings(ctx.settings)
+
+    class PartialMockKIS(MockKISClient):
+        def __init__(self, c: UserContext) -> None:
+            super().__init__(c)
+            self.stage = 1
+
+        def inquire_ccnl(self, order_no: str = "", market: str = "KR", lookback_days: int = 5) -> List[Dict[str, Any]]:
+            if self.stage == 1:
+                return [{"order_no": order_no, "symbol": "005930", "filled_qty": 3, "unfilled_qty": 7, "avg_price": 70_000}]
+            return [{"order_no": order_no, "symbol": "005930", "filled_qty": 10, "unfilled_qty": 0, "avg_price": 70_500}]
+
+    kis = PartialMockKIS(ctx)
+    svc = OrderService(ctx, sheet, kis, notifier=TelegramNotifier(ctx, dry_run=True))
+    sig = Signal(
+        SignalAction.BUY,
+        "kr_fujimoto_126",
+        "1.0.0",
+        "005930",
+        Market.KR,
+        PriceType.LIMIT,
+        70_000,
+        qty=10,
+        metadata={"next_entry_stage": 1},
+    )
+    out = svc.execute_signal(sig, user_confirmed=True)
+    assert out.executed and out.filled_qty == 3
+    assert sheet.load_lots(use_cache=False)[0].qty == 3
+    assert sheet.load_pending_orders(use_cache=False)[0].status == PendingOrderStatus.PARTIAL
+
+    # Remaining 7 shares fill later
+    kis.stage = 2
+    settled = svc.sync_pending_orders(markets=("KR",))
+    assert len(settled) == 1
+    assert settled[0].filled_qty == 7
+
+    lots = sheet.load_lots(use_cache=False)
+    assert len(lots) == 1
+    assert lots[0].qty == 10
+    assert lots[0].algo_state["entry_stage"] == 1
+    assert sheet.load_pending_orders(use_cache=False)[0].status == PendingOrderStatus.FILLED
+
+
+def test_mixed_legacy_and_iso_dates_sort_chronologically() -> None:
+    """B: Legacy Korean locale date ('2026. 11. 20') and ISO ('2026-11-27') must sort chronologically."""
+    lot = Lot.from_sheet_row(
+        {"lot_id": "lot_1", "symbol": "005930", "market": "KR", "algo_id": "kr_fujimoto_126", "buy_date": "2026. 11. 20"}
+    )
+    assert lot.buy_date == "2026-11-20"
+    f_buy = Fill.from_sheet_row(
+        {"fill_id": "f1", "lot_id": "lot_1", "side": "BUY", "date": "2026. 11. 20", "qty": 10, "price": 100}
+    )
+    assert f_buy.date == "2026-11-20"
+
+    # Even if raw unnormalized Fill objects are passed directly to calculator, sorting uses parsed dates
+    raw_buy = Fill("f1", "lot_1", FillSide.BUY, "2026. 11. 20", qty=10, price=100)
+    raw_sell = Fill("f2", "lot_1", FillSide.SELL, "2026-11-27", qty=4, price=110)
+    metrics = recalculate_lot_from_fills(lot, [raw_buy, raw_sell])
+    assert metrics.remaining_qty == 6
+    assert metrics.realized_pnl == 40.0
+
+
+def test_pending_queue_strict_fifo_and_fill_dedup_and_reconcile_skip(tmp_path: Path) -> None:
+    """C, D, E: Queue stops on first failure, deduplicates Fills by fill_id, and skips reconcile while queued."""
+    ctx = _make_ctx(tmp_path)
+    backend = InMemorySheetBackend(ctx.sheet_id)
+    sheet = UserSheetManager(ctx, backend=backend)
+    sheet.save_user_settings(ctx.settings)
+    kis = MockKISClient(ctx)
+    svc = OrderService(ctx, sheet, kis, notifier=TelegramNotifier(ctx, dry_run=True))
+
+    orig_append = backend.append_rows
+
+    def always_fail_fills(tab_name: str, rows: List[List[Any]]) -> None:
+        if tab_name == "Fills":
+            raise RuntimeError("transient error")
+        orig_append(tab_name, rows)
+
+    backend.append_rows = always_fail_fills  # type: ignore[method-assign]
+    sig = Signal(SignalAction.BUY, "kr_fujimoto_126", "1.0.0", "005930", Market.KR, PriceType.LIMIT, 70_000, qty=2)
+    svc.execute_signal(sig, user_confirmed=True)
+
+    # C: Flushing while Fills still fails must NOT flush Lots ahead of Fills
+    assert sheet.flush_pending_writes() == 0
+    assert sheet.has_pending_writes()
+    assert len(sheet.load_lots(use_cache=False)) == 0
+
+    # E: Reconciliation must skip when pending writes remain
+    kis.holdings = [{"symbol": "005930", "market": "KR", "qty": 2, "avg_price": 70_000}]
+    report = run_daily_reconciliation(ctx, sheet, kis, markets=("KR",))
+    assert report.skipped_reason != ""
+    assert len(sheet.load_lots(use_cache=False)) == 0
+
+    # D: Simulate Fill already written on server before timeout, then flush -> must NOT duplicate fill_id
+    backend.append_rows = orig_append  # type: ignore[method-assign]
+    import json
+
+    queued = json.loads(sheet._pending_queue_path.read_text(encoding="utf-8"))
+    queued_fill_dict = queued[0]["payload"][0]
+    sheet.append_fills([Fill.from_sheet_row(queued_fill_dict)])
+    assert len(sheet.load_fills(use_cache=False)) == 1
+
+    flushed = sheet.flush_pending_writes()
+    assert flushed == 2
+    assert len(sheet.load_fills(use_cache=False)) == 1  # deduplicated!
+    assert len(sheet.load_lots(use_cache=False)) == 1
+
+
+def test_gspread_upsert_preserves_user_custom_columns() -> None:
+    """Custom user-added columns in Lots tab are never overwritten by upsert_rows_by_key."""
+    ws = MagicMock()
+    headers = ["lot_id", "symbol", "user_memo", "qty"]
+    ws.col_values.return_value = ["lot_id", "lot_a"]
+    backend = _make_mock_gspread_backend(ws, "Lots", headers)
+
+    backend.upsert_rows_by_key("Lots", "lot_id", [{"lot_id": "lot_a", "symbol": "005930", "qty": 10}])
+
+    # Should update A2:B2 and D2:D2, leaving C2 (user_memo) completely untouched
+    ws.batch_update.assert_called_once_with(
+        [
+            {"range": "A2:B2", "values": [["lot_a", "005930"]]},
+            {"range": "D2:D2", "values": [[10]]},
+        ],
+        value_input_option="RAW",
+    )
 
 
 def test_order_service_records_estimated_kr_fee_and_sell_tax(tmp_path: Path) -> None:

@@ -7,9 +7,10 @@ grouped by (symbol, algo_id) with derived qty/avg_price and algorithm state.
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
@@ -20,6 +21,34 @@ def utc_now_iso() -> str:
 
 def generate_id(prefix: str) -> str:
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
+
+
+def parse_date_str(date_str: str) -> Optional[date]:
+    """Parse ISO, slash, compact, or Korean Google Sheets locale dates (e.g. '2026. 11. 27')."""
+    if not date_str:
+        return None
+    raw = str(date_str).strip()
+    m = re.match(r"^(\d{4})\s*[-./]\s*(\d{1,2})\s*[-./]\s*(\d{1,2})", raw)
+    if m:
+        try:
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+        except ValueError:
+            return None
+    m_compact = re.match(r"^(\d{4})(\d{2})(\d{2})$", raw)
+    if m_compact:
+        try:
+            return date(int(m_compact.group(1)), int(m_compact.group(2)), int(m_compact.group(3)))
+        except ValueError:
+            return None
+    return None
+
+
+def normalize_date_str(date_str: str) -> str:
+    """Normalize any supported date string into canonical YYYY-MM-DD format."""
+    parsed = parse_date_str(date_str)
+    if parsed is not None:
+        return parsed.strftime("%Y-%m-%d")
+    return str(date_str or "").strip()
 
 
 class LotStatus(str, Enum):
@@ -90,7 +119,7 @@ class Lot:
             market=market,
             algo_id=str(row.get("algo_id", "manual")).strip(),
             algo_version=str(row.get("algo_version", "1.0.0")).strip(),
-            buy_date=str(row.get("buy_date", "")).strip(),
+            buy_date=normalize_date_str(str(row.get("buy_date", ""))),
             qty=int(float(row.get("qty", 0) or 0)),
             avg_price=float(row.get("avg_price", 0.0) or 0.0),
             status=status,
@@ -137,7 +166,7 @@ class Fill:
             fill_id=str(row.get("fill_id", "")),
             lot_id=str(row.get("lot_id", "")),
             side=side,
-            date=str(row.get("date", "")),
+            date=normalize_date_str(str(row.get("date", ""))),
             qty=int(float(row.get("qty", 0) or 0)),
             price=float(row.get("price", 0.0) or 0.0),
             fee=float(row.get("fee", 0.0) or 0.0),
@@ -189,6 +218,98 @@ class AuditRecord:
             "action": self.action,
             "detail": self.detail,
         }
+
+
+class PendingOrderStatus(str, Enum):
+    SUBMITTED = "SUBMITTED"
+    PARTIAL = "PARTIAL"
+    FILLED = "FILLED"
+    EXPIRED = "EXPIRED"
+
+
+@dataclass
+class PendingOrder:
+    """Tracks submitted/partially-filled orders awaiting subsequent fill confirmation."""
+    order_no: str
+    symbol: str
+    market: str
+    algo_id: str
+    algo_version: str
+    side: str                           # BUY | SELL
+    req_qty: int
+    recorded_filled_qty: int = 0
+    limit_price: float = 0.0
+    lot_id: str = ""
+    status: PendingOrderStatus = PendingOrderStatus.SUBMITTED
+    order_date: str = ""                # YYYY-MM-DD
+    created_at: str = ""
+    updated_at: str = ""
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    conditions: List[Dict[str, Any]] = field(default_factory=list)
+    reason_text: str = ""
+
+    def to_sheet_row(self) -> Dict[str, Any]:
+        return {
+            "order_no": str(self.order_no).strip(),
+            "symbol": str(self.symbol).strip(),
+            "market": str(self.market).strip().upper(),
+            "algo_id": str(self.algo_id).strip(),
+            "algo_version": str(self.algo_version).strip(),
+            "side": str(self.side).strip().upper(),
+            "req_qty": int(self.req_qty),
+            "recorded_filled_qty": int(self.recorded_filled_qty),
+            "limit_price": round(float(self.limit_price), 4),
+            "lot_id": str(self.lot_id or "").strip(),
+            "status": self.status.value if isinstance(self.status, PendingOrderStatus) else str(self.status),
+            "order_date": normalize_date_str(self.order_date),
+            "created_at": str(self.created_at),
+            "updated_at": str(self.updated_at),
+            "metadata_json": json.dumps(self.metadata, ensure_ascii=False),
+            "conditions_json": json.dumps(self.conditions, ensure_ascii=False),
+            "reason_text": str(self.reason_text),
+        }
+
+    @classmethod
+    def from_sheet_row(cls, row: Dict[str, Any]) -> "PendingOrder":
+        def _load_json(raw: Any, default: Any) -> Any:
+            if isinstance(raw, (dict, list)):
+                return raw
+            if not raw:
+                return default
+            try:
+                return json.loads(str(raw))
+            except json.JSONDecodeError:
+                return default
+
+        market = str(row.get("market", "KR")).strip().upper()
+        raw_sym = str(row.get("symbol", "")).strip()
+        if market == "KR" and raw_sym.isdigit() and len(raw_sym) < 6:
+            raw_sym = raw_sym.zfill(6)
+        status_raw = str(row.get("status", PendingOrderStatus.SUBMITTED.value)).strip().upper()
+        status = (
+            PendingOrderStatus(status_raw)
+            if status_raw in {s.value for s in PendingOrderStatus}
+            else PendingOrderStatus.SUBMITTED
+        )
+        return cls(
+            order_no=str(row.get("order_no", "")).strip(),
+            symbol=raw_sym,
+            market=market,
+            algo_id=str(row.get("algo_id", "")).strip(),
+            algo_version=str(row.get("algo_version", "1.0.0")).strip(),
+            side=str(row.get("side", "BUY")).strip().upper(),
+            req_qty=int(float(row.get("req_qty", 0) or 0)),
+            recorded_filled_qty=int(float(row.get("recorded_filled_qty", 0) or 0)),
+            limit_price=float(row.get("limit_price", 0.0) or 0.0),
+            lot_id=str(row.get("lot_id", "")).strip(),
+            status=status,
+            order_date=normalize_date_str(str(row.get("order_date", ""))),
+            created_at=str(row.get("created_at", "")).strip(),
+            updated_at=str(row.get("updated_at", "")).strip(),
+            metadata=_load_json(row.get("metadata_json"), {}),
+            conditions=_load_json(row.get("conditions_json"), []),
+            reason_text=str(row.get("reason_text", "")),
+        )
 
 
 @dataclass(frozen=True)

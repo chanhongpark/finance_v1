@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from core.context import UserContext, UserSettings
-from core.ledger.models import AuditRecord, Fill, Lot, SignalRecord, utc_now_iso
+from core.ledger.models import AuditRecord, Fill, Lot, PendingOrder, SignalRecord, utc_now_iso
 from core.sheets.schema import SCHEMA_VERSION, SHEET_SCHEMAS, compute_missing_columns
 
 logger = logging.getLogger(__name__)
@@ -119,10 +119,15 @@ class InMemorySheetBackend(SheetBackend):
             key = str(rec.get(key_col, ""))
             if not key:
                 continue
-            row_dict = {col: rec.get(col, "") for col in headers}
             if key in index_by_key:
-                table[index_by_key[key]] = row_dict
+                # Preserve user-added custom columns not present in rec
+                existing_row = dict(table[index_by_key[key]])
+                for col in headers:
+                    if col in rec:
+                        existing_row[col] = rec[col]
+                table[index_by_key[key]] = existing_row
             else:
+                row_dict = {col: rec.get(col, "") for col in headers}
                 index_by_key[key] = len(table)
                 table.append(row_dict)
 
@@ -239,7 +244,6 @@ class GSpreadBackend(SheetBackend):
             if val_str:
                 row_num_by_key[val_str] = row_idx
 
-        end_col = _col_letter(len(headers))
         batch_updates: List[Dict[str, Any]] = []
         to_append: List[List[Any]] = []
 
@@ -247,12 +251,27 @@ class GSpreadBackend(SheetBackend):
             key = str(rec.get(key_col, "")).strip()
             if not key:
                 continue
-            row_vals = [rec.get(col, "") for col in headers]
             if key in row_num_by_key:
                 row_num = row_num_by_key[key]
-                batch_updates.append({"range": f"A{row_num}:{end_col}{row_num}", "values": [row_vals]})
+                # Only update contiguous spans of columns present in rec so user-added custom columns stay intact
+                managed_indices = [i for i, col in enumerate(headers) if col in rec]
+                if not managed_indices:
+                    continue
+                span_start = managed_indices[0]
+                span_prev = managed_indices[0]
+                for idx in managed_indices[1:] + [None]:
+                    if idx is not None and idx == span_prev + 1:
+                        span_prev = idx
+                        continue
+                    start_col = _col_letter(span_start + 1)
+                    end_col = _col_letter(span_prev + 1)
+                    vals = [rec[headers[c]] for c in range(span_start, span_prev + 1)]
+                    batch_updates.append({"range": f"{start_col}{row_num}:{end_col}{row_num}", "values": [vals]})
+                    if idx is not None:
+                        span_start = idx
+                        span_prev = idx
             else:
-                to_append.append(row_vals)
+                to_append.append([rec.get(col, "") for col in headers])
 
         if batch_updates:
             self._call_with_retry(ws.batch_update, batch_updates, value_input_option="RAW")
@@ -332,8 +351,17 @@ class UserSheetManager:
         queue.append(entry)
         self._pending_queue_path.write_text(json.dumps(queue, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    def has_pending_writes(self) -> bool:
+        if not self._pending_queue_path.exists():
+            return False
+        try:
+            queue = json.loads(self._pending_queue_path.read_text(encoding="utf-8"))
+            return bool(queue)
+        except Exception:
+            return False
+
     def flush_pending_writes(self) -> int:
-        """Retry any writes previously queued due to quota/network errors."""
+        """Retry queued writes in strict FIFO order (stop on first failure) with Fill deduplication."""
         if not self._pending_queue_path.exists():
             return 0
         try:
@@ -345,19 +373,39 @@ class UserSheetManager:
 
         remaining: List[Dict[str, Any]] = []
         flushed = 0
-        for item in queue:
+        for idx, item in enumerate(queue):
             try:
                 op = item.get("op")
                 tab = item["tab"]
                 if op == "append_rows":
                     payload = item["payload"]
-                    if payload and isinstance(payload[0], dict):
-                        headers = self._backend.get_headers(tab) or SHEET_SCHEMAS[tab]
-                        rows = [[d.get(col, "") for col in headers] for d in payload]
-                    else:
-                        rows = payload
-                    self._backend.append_rows(tab, rows)
-                    self.invalidate_cache(tab)
+                    headers = self._backend.get_headers(tab) or SHEET_SCHEMAS[tab]
+                    if tab == "Fills":
+                        # Deduplicate by fill_id so timeout retries / concurrent tabs never double-record
+                        existing_records = self._backend.read_records("Fills")
+                        existing_ids = {
+                            str(r.get("fill_id", "")).strip()
+                            for r in existing_records
+                            if r.get("fill_id")
+                        }
+                        if payload and isinstance(payload[0], dict):
+                            payload = [
+                                d for d in payload
+                                if str(d.get("fill_id", "")).strip() not in existing_ids
+                            ]
+                        elif payload and "fill_id" in headers:
+                            fid_idx = headers.index("fill_id")
+                            payload = [
+                                r for r in payload
+                                if fid_idx >= len(r) or str(r[fid_idx]).strip() not in existing_ids
+                            ]
+                    if payload:
+                        if isinstance(payload[0], dict):
+                            rows = [[d.get(col, "") for col in headers] for d in payload]
+                        else:
+                            rows = payload
+                        self._backend.append_rows(tab, rows)
+                        self.invalidate_cache(tab)
                     flushed += 1
                 elif op == "upsert_rows":
                     key_col = str(item.get("key_col", "lot_id"))
@@ -365,8 +413,10 @@ class UserSheetManager:
                     self.invalidate_cache(tab)
                     flushed += 1
             except Exception as exc:
-                logger.warning("Failed to flush pending write for %s: %s", item.get("tab"), exc)
-                remaining.append(item)
+                logger.warning("Failed to flush pending write for %s (preserving FIFO order): %s", item.get("tab"), exc)
+                # Preserve strict FIFO order: keep this item and all subsequent items
+                remaining.extend(queue[idx:])
+                break
 
         self._pending_queue_path.write_text(json.dumps(remaining, ensure_ascii=False, indent=2), encoding="utf-8")
         return flushed
@@ -474,15 +524,15 @@ class UserSheetManager:
         self._backend.overwrite_table("Lots", headers, rows)
         self.invalidate_cache("Lots")
 
-    def upsert_lots(self, updated_lots: List[Lot], queue_only: bool = False) -> List[Lot]:
-        """Row-level upsert by lot_id to avoid full-table overwrite and lost updates."""
+    def upsert_lots(self, updated_lots: List[Lot], queue_only: bool = False) -> bool:
+        """Row-level upsert by lot_id without unnecessary full-table reload."""
         dicts = [lot.to_sheet_row() for lot in updated_lots]
-        if dicts:
-            if queue_only:
-                self._enqueue_failed_write("upsert_rows", "Lots", dicts, key_col="lot_id")
-            else:
-                self._safe_upsert("Lots", "lot_id", dicts)
-        return self.load_lots(use_cache=False)
+        if not dicts:
+            return True
+        if queue_only:
+            self._enqueue_failed_write("upsert_rows", "Lots", dicts, key_col="lot_id")
+            return False
+        return self._safe_upsert("Lots", "lot_id", dicts)
 
     def load_fills(self, use_cache: bool = True) -> List[Fill]:
         rows = self._read_tab("Fills", use_cache=use_cache)
@@ -491,6 +541,22 @@ class UserSheetManager:
     def append_fills(self, fills: List[Fill]) -> bool:
         """Append-only ledger write (R2.2). Returns True if written immediately, False if queued."""
         return self._safe_append("Fills", [f.to_sheet_row() for f in fills])
+
+    # ------------------------------------------------------------------
+    # PendingOrders (Upsert by order_no for deferred/partial fill settlement)
+    # ------------------------------------------------------------------
+    def load_pending_orders(self, use_cache: bool = True) -> List[PendingOrder]:
+        rows = self._read_tab("PendingOrders", use_cache=use_cache)
+        return [PendingOrder.from_sheet_row(r) for r in rows if r.get("order_no")]
+
+    def upsert_pending_orders(self, orders: List[PendingOrder], queue_only: bool = False) -> bool:
+        dicts = [o.to_sheet_row() for o in orders]
+        if not dicts:
+            return True
+        if queue_only:
+            self._enqueue_failed_write("upsert_rows", "PendingOrders", dicts, key_col="order_no")
+            return False
+        return self._safe_upsert("PendingOrders", "order_no", dicts)
 
     # ------------------------------------------------------------------
     # Signals & Audit (Append-only)

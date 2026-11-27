@@ -46,7 +46,9 @@ def render_dashboard(services: AppServices) -> None:
             markets=("KR", "US"),
             notifier=services.notifier,
         )
-        if report.is_matched:
+        if report.skipped_reason:
+            st.warning(f"⚠️ {report.skipped_reason}")
+        elif report.is_matched:
             st.success("✅ KIS 잔고와 Google Sheet 보유 원장이 100% 일치합니다.")
         else:
             st.warning(f"⚠️ {len(report.discrepancies)}건의 불일치가 감지되어 처리되었습니다.")

@@ -334,18 +334,20 @@ class KISClient:
             "message": data.get("msg1", ""),
         }
 
-    def inquire_ccnl(self, order_no: str = "", market: str = "KR") -> List[Dict[str, Any]]:
-        """Query confirmed executions so only filled quantities are recorded as Fills (R5.5)."""
+    def inquire_ccnl(self, order_no: str = "", market: str = "KR", lookback_days: int = 5) -> List[Dict[str, Any]]:
+        """Query executions across a lookback window so timezone/LOC next-day fills are captured (R5.5)."""
         self.rate_limiter.acquire()
-        today_str = datetime.now().strftime("%Y%m%d")
+        now = datetime.now()
+        start_str = (now - timedelta(days=max(0, int(lookback_days)))).strftime("%Y%m%d")
+        end_str = (now + timedelta(days=1)).strftime("%Y%m%d")
         if market.upper() == "KR":
             tr_id = "VTTC8001R" if self.ctx.is_mock else "TTTC8001R"
             url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
             params = {
                 "CANO": self.ctx.credentials.account_prefix,
                 "ACNT_PRDT_CD": self.ctx.credentials.account_suffix,
-                "INQR_STRT_DT": today_str,
-                "INQR_END_DT": today_str,
+                "INQR_STRT_DT": start_str,
+                "INQR_END_DT": end_str,
                 "SLL_BUY_DVSN_CD": "00",
                 "INQR_DVSN": "00",
                 "PDNO": "",
@@ -370,15 +372,15 @@ class KISClient:
                 }
                 for r in rows
             ]
-        # US overseas stock execution inquiry
+        # US overseas stock execution inquiry (wider window covers KST/EST date offset & next-day LOC settlement)
         tr_id = "VTTS3035R" if self.ctx.is_mock else "TTTS3035R"
         url = f"{self.base_url}/uapi/overseas-stock/v1/trading/inquire-ccnl"
         params = {
             "CANO": self.ctx.credentials.account_prefix,
             "ACNT_PRDT_CD": self.ctx.credentials.account_suffix,
             "PDNO": "",
-            "ORD_STRT_DT": today_str,
-            "ORD_END_DT": today_str,
+            "ORD_STRT_DT": start_str,
+            "ORD_END_DT": end_str,
             "SLL_BUY_DVSN": "00",
             "CCLD_NCCS_DVSN": "00",
             "OVRS_EXCG_CD": "",
@@ -454,7 +456,7 @@ class MockKISClient:
         }
         return {"success": True, "order_no": order_no, "message": "MOCK_OK"}
 
-    def inquire_ccnl(self, order_no: str = "", market: str = "KR") -> List[Dict[str, Any]]:
+    def inquire_ccnl(self, order_no: str = "", market: str = "KR", lookback_days: int = 5) -> List[Dict[str, Any]]:
         if order_no and order_no in self.confirmed_fills:
             return [dict(self.confirmed_fills[order_no])]
         return [dict(v) for v in self.confirmed_fills.values()]

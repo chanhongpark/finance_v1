@@ -3,8 +3,7 @@ Append-only Fill ledger calculator and multi-lot sell allocator (R2.2, R5.4, R5.
 """
 from __future__ import annotations
 
-from datetime import date, datetime
-import re
+from datetime import date
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 from core.ledger.models import (
@@ -14,28 +13,12 @@ from core.ledger.models import (
     Lot,
     LotMetrics,
     LotStatus,
+    parse_date_str,
 )
 
 
 def _parse_date(date_str: str) -> Optional[date]:
-    if not date_str:
-        return None
-    raw = str(date_str).strip()
-    # Supports ISO ("2026-11-27", "2026-11-27T..."), slash ("2026/11/27"),
-    # and Korean Google Sheets locale ("2026. 11. 27" / "2026. 11. 27.")
-    m = re.match(r"^(\d{4})\s*[-./]\s*(\d{1,2})\s*[-./]\s*(\d{1,2})", raw)
-    if m:
-        try:
-            return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
-        except ValueError:
-            return None
-    m_compact = re.match(r"^(\d{4})(\d{2})(\d{2})$", raw)
-    if m_compact:
-        try:
-            return date(int(m_compact.group(1)), int(m_compact.group(2)), int(m_compact.group(3)))
-        except ValueError:
-            return None
-    return None
+    return parse_date_str(date_str)
 
 
 def recalculate_lot_from_fills(
@@ -49,7 +32,7 @@ def recalculate_lot_from_fills(
     """
     lot_fills = sorted(
         [f for f in fills if f.lot_id == lot.lot_id],
-        key=lambda f: (f.date, 0 if f.side == FillSide.BUY else 1, f.fill_id),
+        key=lambda f: (_parse_date(f.date) or date.max, 0 if f.side == FillSide.BUY else 1, f.fill_id),
     )
 
     running_qty = 0
@@ -175,10 +158,10 @@ def allocate_sell_across_lots(
         if lot.symbol == symbol and lot.status == LotStatus.OPEN and lot.qty > 0
     ]
 
-    def _sort_key(lot: Lot) -> Tuple[int, int, str, str]:
+    def _sort_key(lot: Lot) -> Tuple[int, int, date, str]:
         p_lot = 0 if (preferred_lot_id and lot.lot_id == preferred_lot_id) else 1
         p_algo = 0 if (preferred_algo_id and lot.algo_id == preferred_algo_id) else 1
-        return (p_lot, p_algo, lot.buy_date or "9999-12-31", lot.lot_id)
+        return (p_lot, p_algo, _parse_date(lot.buy_date) or date.max, lot.lot_id)
 
     ordered = sorted(candidates, key=_sort_key)
     remaining = int(sell_qty)
@@ -234,7 +217,7 @@ def calculate_algorithm_performance(
         equity = 1.0
         peak = 1.0
         max_dd = 0.0
-        for _, m in sorted(closed_items, key=lambda x: (x[0].buy_date, x[0].lot_id)):
+        for _, m in sorted(closed_items, key=lambda x: (_parse_date(x[0].buy_date) or date.max, x[0].lot_id)):
             equity *= (1.0 + m.realized_return_pct / 100.0)
             if equity > peak:
                 peak = equity

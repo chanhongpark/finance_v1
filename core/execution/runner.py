@@ -13,7 +13,7 @@ from core.algorithms import Market, Signal, USInfiniteBuyingAlgorithm, default_r
 from core.context import UserContext
 from core.data.market_data_provider import HybridMarketDataProvider
 from core.execution.order_service import ExecutionOutcome, OrderService
-from core.ledger.models import LotStatus
+from core.ledger.models import AuditRecord, LotStatus, utc_now_iso
 from core.ledger.reconciler import ReconciliationReport, reconcile_holdings
 from core.notifier.telegram import TelegramNotifier
 from core.risk.risk_manager import RiskManager
@@ -243,8 +243,28 @@ def run_daily_reconciliation(
     notifier: Optional[TelegramNotifier] = None,
 ) -> ReconciliationReport:
     """
-    Compare KIS actual holdings against Sheet OPEN lots across requested markets (R2.3).
+    Flush queued writes, settle any pending/partial broker orders first,
+    then compare KIS actual holdings against Sheet OPEN lots across requested markets (R2.3).
     """
+    # 1. Flush any local pending writes first; abort reconciliation if queue still remains
+    sheet_manager.flush_pending_writes()
+    if sheet_manager.has_pending_writes():
+        reason = "미반영 로컬 대기열(pending_writes)이 남아 있어 이중 계산 방지를 위해 잔고 대사를 건너뛰었습니다."
+        logger.warning("%s (user=%s)", reason, ctx.user_id)
+        if notifier is not None:
+            notifier.send_text(f"⚠️ [잔고 대사 보류]\n{reason}")
+        return ReconciliationReport(ts=utc_now_iso(), is_matched=False, skipped_reason=reason)
+
+    # 2. Settle any SUBMITTED/PARTIAL orders (e.g. US LOC or KR limit fills) BEFORE balance comparison
+    order_svc = OrderService(ctx, sheet_manager, kis_client, notifier=notifier)
+    order_svc.sync_pending_orders(markets=markets)
+
+    # Re-check queue in case settling pending orders queued writes due to quota error
+    if sheet_manager.has_pending_writes():
+        reason = "체결 정산 중 시트 기록이 대기열에 남아 잔고 대사를 보류했습니다."
+        logger.warning("%s (user=%s)", reason, ctx.user_id)
+        return ReconciliationReport(ts=utc_now_iso(), is_matched=False, skipped_reason=reason)
+
     kis_holdings: List[Dict[str, Any]] = []
     for mkt in markets:
         try:
@@ -256,8 +276,10 @@ def run_daily_reconciliation(
     report = reconcile_holdings(kis_holdings, sheet_lots, actor=f"reconciler:{ctx.user_id}")
 
     if report.created_fills:
-        sheet_manager.append_fills(report.created_fills)
-    if report.created_manual_lots:
+        fills_written = sheet_manager.append_fills(report.created_fills)
+        if report.created_manual_lots:
+            sheet_manager.upsert_lots(report.created_manual_lots, queue_only=not fills_written)
+    elif report.created_manual_lots:
         sheet_manager.upsert_lots(report.created_manual_lots)
     for audit in report.audits:
         sheet_manager.append_audit(audit)
