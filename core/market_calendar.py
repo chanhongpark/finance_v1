@@ -3,7 +3,7 @@ KR / US market calendar, timezone, and US Daylight Saving Time utilities (R10).
 """
 from __future__ import annotations
 
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timedelta
 from typing import Optional, Set
 from zoneinfo import ZoneInfo
 
@@ -81,3 +81,55 @@ def is_us_regular_session_open(dt: Optional[datetime] = None) -> bool:
     if is_us_market_holiday(et_dt.date()):
         return False
     return time(9, 30) <= et_dt.time() <= time(16, 0)
+
+
+def market_now(market: str, dt: Optional[datetime] = None) -> datetime:
+    """Return `dt` (or current time) converted to the market's local timezone."""
+    tz = US_EASTERN if market.upper() == "US" else KST
+    if dt is None:
+        return datetime.now(tz)
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=tz)
+    return dt.astimezone(tz)
+
+
+def is_market_regular_session_open(
+    market: str,
+    dt: Optional[datetime] = None,
+    extra_holidays: Optional[Set[str]] = None,
+) -> bool:
+    """Return True if the given market's regular trading session is currently open."""
+    mkt = market.upper()
+    local_dt = market_now(mkt, dt)
+    if mkt == "US":
+        if is_us_market_holiday(local_dt.date(), extra_holidays=extra_holidays):
+            return False
+        return time(9, 30) <= local_dt.time() <= time(16, 0)
+    if is_kr_market_holiday(local_dt.date(), extra_holidays=extra_holidays):
+        return False
+    return time(9, 0) <= local_dt.time() <= time(15, 30)
+
+
+def last_closed_session(
+    market: str,
+    dt: Optional[datetime] = None,
+    extra_holidays: Optional[Set[str]] = None,
+) -> date:
+    """
+    Return the date (in the market's own timezone) of the most recently completed regular session.
+    Before/during a trading session, returns the previous trading day so incomplete intraday bars
+    are never cached to disk as final daily candles.
+    """
+    mkt = market.upper()
+    local_dt = market_now(mkt, dt)
+    close_time = time(16, 0) if mkt == "US" else time(15, 30)
+    is_holiday_fn = is_us_market_holiday if mkt == "US" else is_kr_market_holiday
+
+    d = local_dt.date()
+    if not is_holiday_fn(d, extra_holidays=extra_holidays) and local_dt.time() > close_time:
+        return d
+
+    d -= timedelta(days=1)
+    while is_holiday_fn(d, extra_holidays=extra_holidays):
+        d -= timedelta(days=1)
+    return d
