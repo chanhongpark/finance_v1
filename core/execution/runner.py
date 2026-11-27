@@ -108,7 +108,7 @@ def _run_market_screening(
                 continue
             quote = data_provider.get_live_quote(sym, market=mkt_str)
             if quote:
-                ohlcv_map[sym] = data_provider.stitch_live_quote(base_df, quote)
+                ohlcv_map[sym] = data_provider.stitch_live_quote_if_applicable(base_df, quote, market=mkt_str)
 
         # Re-evaluate buy candidates with stitched live candle
         for sym in stage1_candidate_symbols:

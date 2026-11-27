@@ -4,13 +4,19 @@ KR / US market calendar, timezone, and US Daylight Saving Time utilities (R10).
 from __future__ import annotations
 
 from datetime import date, datetime, time, timedelta
-from typing import Optional, Set
+from functools import lru_cache
+from typing import FrozenSet, Optional, Set
 from zoneinfo import ZoneInfo
+
+try:
+    import holidays as _holidays_lib
+except ImportError:  # pragma: no cover - fallback when holidays is not installed
+    _holidays_lib = None
 
 KST = ZoneInfo("Asia/Seoul")
 US_EASTERN = ZoneInfo("America/New_York")
 
-# Fixed & major recurring holidays (YYYY-MM-DD can be extended per year)
+# Fixed fallback holidays (used when `holidays` package is unavailable)
 KR_FIXED_MONTH_DAY: Set[tuple[int, int]] = {
     (1, 1),   # 신정
     (3, 1),   # 삼일절
@@ -32,6 +38,34 @@ US_FIXED_MONTH_DAY: Set[tuple[int, int]] = {
 }
 
 
+@lru_cache(maxsize=32)
+def _krx_holidays_for_year(year: int) -> FrozenSet[date]:
+    days: Set[date] = {date(year, 12, 31)}  # KRX year-end closing day
+    if _holidays_lib is not None:
+        kr = _holidays_lib.country_holidays("KR", years=year)
+        for d in kr.keys():
+            # Constitution Day (Jul 17) is not a KRX trading holiday
+            if (d.month, d.day) == (7, 17):
+                continue
+            days.add(d)
+    else:
+        for m, day in KR_FIXED_MONTH_DAY:
+            days.add(date(year, m, day))
+    return frozenset(days)
+
+
+@lru_cache(maxsize=32)
+def _nyse_holidays_for_year(year: int) -> FrozenSet[date]:
+    days: Set[date] = set()
+    if _holidays_lib is not None:
+        nyse = _holidays_lib.financial_holidays("NYSE", years=year)
+        days.update(nyse.keys())
+    else:
+        for m, day in US_FIXED_MONTH_DAY:
+            days.add(date(year, m, day))
+    return frozenset(days)
+
+
 def now_kst() -> datetime:
     return datetime.now(KST)
 
@@ -51,7 +85,7 @@ def is_kr_market_holiday(d: Optional[date] = None, extra_holidays: Optional[Set[
     target = d or now_kst().date()
     if target.weekday() >= 5:
         return True
-    if (target.month, target.day) in KR_FIXED_MONTH_DAY:
+    if target in _krx_holidays_for_year(target.year):
         return True
     if extra_holidays and target.strftime("%Y-%m-%d") in extra_holidays:
         return True
@@ -62,7 +96,7 @@ def is_us_market_holiday(d: Optional[date] = None, extra_holidays: Optional[Set[
     target = d or now_us_eastern().date()
     if target.weekday() >= 5:
         return True
-    if (target.month, target.day) in US_FIXED_MONTH_DAY:
+    if target in _nyse_holidays_for_year(target.year):
         return True
     if extra_holidays and target.strftime("%Y-%m-%d") in extra_holidays:
         return True
@@ -70,26 +104,28 @@ def is_us_market_holiday(d: Optional[date] = None, extra_holidays: Optional[Set[
 
 
 def is_kr_regular_session_open(dt: Optional[datetime] = None) -> bool:
-    kst_dt = (dt or now_kst()).astimezone(KST)
+    kst_dt = market_now("KR", dt)
     if is_kr_market_holiday(kst_dt.date()):
         return False
     return time(9, 0) <= kst_dt.time() <= time(15, 30)
 
 
 def is_us_regular_session_open(dt: Optional[datetime] = None) -> bool:
-    et_dt = (dt or now_us_eastern()).astimezone(US_EASTERN)
+    et_dt = market_now("US", dt)
     if is_us_market_holiday(et_dt.date()):
         return False
     return time(9, 30) <= et_dt.time() <= time(16, 0)
 
 
 def market_now(market: str, dt: Optional[datetime] = None) -> datetime:
-    """Return `dt` (or current time) converted to the market's local timezone."""
+    """Return `dt` (or current time) converted to the market's local timezone.
+    Naive datetimes are interpreted in the host's local timezone before conversion.
+    """
     tz = US_EASTERN if market.upper() == "US" else KST
     if dt is None:
         return datetime.now(tz)
     if dt.tzinfo is None:
-        return dt.replace(tzinfo=tz)
+        return dt.astimezone().astimezone(tz)
     return dt.astimezone(tz)
 
 

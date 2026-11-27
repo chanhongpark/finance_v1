@@ -35,7 +35,15 @@ def _atomic_write_text(path: Path, content: str, encoding: str = "utf-8") -> Non
             fh.write(content)
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(tmp_path, path)
+        # Retry briefly on Windows where a concurrent reader can raise PermissionError
+        for attempt, delay in enumerate((0.02, 0.05, 0.1, 0.0)):
+            try:
+                os.replace(tmp_path, path)
+                return
+            except PermissionError:
+                if attempt == 3:
+                    raise
+                time.sleep(delay)
     except Exception:
         try:
             if tmp_path.exists():

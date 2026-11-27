@@ -224,49 +224,70 @@ def test_split_divergence_triggers_full_refetch(tmp_path: Path) -> None:
     assert all(float(c) == 50.0 for c in df2["close"])
 
 
-def test_holiday_cooldown_and_kr_symbol_normalization_and_empty_fallback(tmp_path: Path) -> None:
+def test_holiday_cooldown_and_kr_symbol_normalization_and_post_close_gap(tmp_path: Path) -> None:
     from datetime import datetime
-    from core.market_calendar import KST
+    from core.market_calendar import KST, US_EASTERN, is_market_regular_session_open, is_us_market_holiday, last_closed_session
 
+    # 1. Real holiday calendar checks (Thanksgiving, Chuseok, Good Friday, Observed Jul 4)
+    us_thanksgiving = datetime(2026, 11, 26, 11, 0, tzinfo=US_EASTERN)
+    assert is_market_regular_session_open("US", dt=us_thanksgiving) is False
+    assert last_closed_session("US", dt=us_thanksgiving) == date(2026, 11, 25)
+    assert is_us_market_holiday(date(2026, 4, 3)) is True   # Good Friday
+    assert is_us_market_holiday(date(2026, 7, 3)) is True   # Independence Day (observed)
+
+    kr_chuseok = datetime(2026, 9, 25, 10, 0, tzinfo=KST)
+    assert is_market_regular_session_open("KR", dt=kr_chuseok) is False
+    assert last_closed_session("KR", dt=kr_chuseok) == date(2026, 9, 23)
+
+    # 2. KR 6-digit normalization + post-close 15-min cooldown + KIS post-close gap fill
     fdr_calls = 0
 
-    def fake_fdr_holiday(symbol: str, start: str, end: str) -> pd.DataFrame:
+    def fake_fdr_lagging(symbol: str, start: str, end: str) -> pd.DataFrame:
         nonlocal fdr_calls
         fdr_calls += 1
-        # Simulate unscheduled weekday holiday on 2026-11-18: FDR only has up to 2026-11-17
+        # Simulate FDR lagging right after close on 2026-11-18: only has up to 2026-11-17
         end_d = min(date.fromisoformat(end), date(2026, 11, 17))
         return _make_bars(date.fromisoformat(start), end_d, close_price=70_000.0)
 
-    cache = SharedMarketCache(tmp_path / "shared")
-    provider = HybridMarketDataProvider(cache=cache, fdr_reader=fake_fdr_holiday, holiday_recheck_seconds=3600.0)
+    ctx = UserContext("u_pc", UserCredentials(is_mock=True), "sheet_pc", base_data_dir=tmp_path / "data")
+    mock_kis = MockKISClient(ctx)
+    mock_kis.quotes["005930"] = {"symbol": "005930", "price": 71_200.0, "open": 70_500.0, "high": 71_500.0, "low": 70_100.0, "volume": 300_000}
 
-    # Seed cache using unpadded "5930" -> normalized to "005930"
+    cache = SharedMarketCache(tmp_path / "shared")
+    provider = HybridMarketDataProvider(
+        cache=cache,
+        kis_client=mock_kis,
+        fdr_reader=fake_fdr_lagging,
+        post_close_recheck_seconds=900.0,
+        holiday_recheck_seconds=14400.0,
+    )
+
+    # 16:00 KST (just after close): unpadded "5930" -> normalized "005930", fills today's close from KIS
     t1 = datetime(2026, 11, 18, 16, 0, tzinfo=KST)
-    provider.get_daily_ohlcv("5930", market="KR", lookback_days=30, now=t1)
+    df1 = provider.get_daily_ohlcv("5930", market="KR", lookback_days=30, include_live_quote=True, now=t1)
     assert fdr_calls == 1
     assert (tmp_path / "shared" / "ohlcv" / "KR" / "005930.csv").exists()
     assert not list((tmp_path / "shared" / "ohlcv" / "KR").glob("*.tmp"))
+    assert df1["date"].iloc[-1] == "2026-11-18"
+    assert float(df1["close"].iloc[-1]) == 71_200.0
 
-    # Second call 30 minutes later with padded "005930" hits same file & holiday cooldown -> 0 FDR calls!
-    t2 = datetime(2026, 11, 18, 16, 30, tzinfo=KST)
+    # 10 min later (within 15-min post-close cooldown): 0 extra FDR calls
+    t2 = datetime(2026, 11, 18, 16, 10, tzinfo=KST)
     provider.get_daily_ohlcv("005930", market="KR", lookback_days=30, now=t2)
     assert fdr_calls == 1
 
-    # Fallback triggers even when FDR returns empty DataFrame (not just on exception)
-    class DummyKISWithFallback:
-        called = 0
+    # 20 min later (past 15-min post-close cooldown): retries FDR!
+    t3 = datetime(2026, 11, 18, 16, 20, tzinfo=KST)
+    provider.get_daily_ohlcv("005930", market="KR", lookback_days=30, now=t3)
+    assert fdr_calls == 2
 
-        def get_daily_ohlcv_fallback(self, symbol: str, market: str = "KR") -> pd.DataFrame:
-            self.called += 1
-            return _make_bars(date(2026, 11, 10), date(2026, 11, 17), close_price=12_300.0)
+    # 3. Stage 2 helper `stitch_live_quote_if_applicable` must NOT add a fake bar on weekend or holiday
+    base_df = cache.load_ohlcv("KR", "005930")
+    sat_kst = datetime(2026, 11, 21, 12, 0, tzinfo=KST)
+    stitched_sat = provider.stitch_live_quote_if_applicable(base_df, mock_kis.quotes["005930"], market="KR", now=sat_kst)
+    assert len(stitched_sat) == len(base_df)
 
-    dummy_kis = DummyKISWithFallback()
-    provider_fb = HybridMarketDataProvider(
-        cache=SharedMarketCache(tmp_path / "shared_fb"),
-        kis_client=dummy_kis,
-        fdr_reader=lambda s, a, b: pd.DataFrame(),
-    )
-    df_fb = provider_fb.get_daily_ohlcv("035420", market="KR", lookback_days=30, as_of=date(2026, 11, 17))
-    assert dummy_kis.called == 1
-    assert not df_fb.empty
-    assert float(df_fb["close"].iloc[-1]) == 12_300.0
+    # 4. `as_of` upper-bound slicing: requesting earlier `as_of` never leaks future cached bars
+    df_past = provider.get_daily_ohlcv("005930", market="KR", lookback_days=30, as_of=date(2026, 11, 13))
+    assert df_past["date"].iloc[-1] == "2026-11-13"
+

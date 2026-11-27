@@ -19,7 +19,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
-from core.data.cache_store import SharedMarketCache, has_overlap_price_divergence, normalize_cache_symbol
+from core.data.cache_store import SharedMarketCache, has_overlap_price_divergence
 from core.indicators import normalize_ohlcv
 from core.market_calendar import is_market_regular_session_open, last_closed_session, market_now
 
@@ -75,6 +75,7 @@ class HybridMarketDataProvider:
         quote_ttl_seconds: float = 30.0,
         max_workers: int = 8,
         holiday_recheck_seconds: float = 4 * 3600.0,
+        post_close_recheck_seconds: float = 15 * 60.0,
         split_divergence_threshold: float = 0.01,
     ) -> None:
         self.cache = cache or SharedMarketCache()
@@ -84,6 +85,7 @@ class HybridMarketDataProvider:
         self.quote_ttl_seconds = quote_ttl_seconds
         self.max_workers = max_workers
         self.holiday_recheck_seconds = holiday_recheck_seconds
+        self.post_close_recheck_seconds = post_close_recheck_seconds
         self.split_divergence_threshold = split_divergence_threshold
         self._quote_cache: Dict[Tuple[str, str], Tuple[float, Dict[str, Any]]] = {}
         self._symbol_names: Dict[Tuple[str, str], str] = {
@@ -243,21 +245,32 @@ class HybridMarketDataProvider:
           unless `as_of` is explicitly supplied.
         """
         mkt = market.upper()
-        norm_sym = normalize_cache_symbol(symbol, mkt)
+        fetch_sym = self._normalize_symbol(symbol, mkt)
+        local_now = market_now(mkt, dt=now)
         target_end = as_of if as_of is not None else last_closed_session(mkt, dt=now)
         start_dt = target_end - timedelta(days=lookback_days)
         target_end_str = target_end.strftime("%Y-%m-%d")
         start_dt_str = start_dt.strftime("%Y-%m-%d")
         now_epoch = now.timestamp() if now is not None else time.time()
 
-        cached_df = self.cache.load_ohlcv(mkt, norm_sym)
-        meta = self.cache.load_ohlcv_meta(mkt, norm_sym)
+        cached_df = self.cache.load_ohlcv(mkt, fetch_sym)
+        meta = self.cache.load_ohlcv_meta(mkt, fetch_sym)
 
         need_head = False
         need_tail = False
         first_cached_dt: Optional[date] = None
         last_cached_dt: Optional[date] = None
         fetched_from_dt = self._parse_ymd(meta.get("fetched_from"))
+
+        # Shorter recheck cooldown right after close on a trading day (for FDR closing-bar publication lag)
+        is_post_close_window = (
+            as_of is None
+            and target_end == local_now.date()
+            and (local_now.hour < 19 if mkt == "KR" else local_now.hour < 19)
+        )
+        effective_recheck_seconds = (
+            self.post_close_recheck_seconds if is_post_close_window else self.holiday_recheck_seconds
+        )
 
         if cached_df is None or cached_df.empty:
             need_head = True
@@ -278,7 +291,7 @@ class HybridMarketDataProvider:
                 if (
                     as_of is None
                     and meta.get("checked_target_date") == target_end_str
-                    and (now_epoch - float(meta.get("checked_at", 0.0) or 0.0)) < self.holiday_recheck_seconds
+                    and (now_epoch - float(meta.get("checked_at", 0.0) or 0.0)) < effective_recheck_seconds
                 ):
                     need_tail = False
                 else:
@@ -286,7 +299,7 @@ class HybridMarketDataProvider:
 
         def _fetch_fdr_capped(f_start: date, f_end: date) -> pd.DataFrame:
             raw = self._fdr_reader(
-                norm_sym,
+                fetch_sym,
                 f_start.strftime("%Y-%m-%d"),
                 f_end.strftime("%Y-%m-%d"),
             )
@@ -302,74 +315,85 @@ class HybridMarketDataProvider:
         df = cached_df
         if need_head or need_tail:
             fdr_succeeded = False
+            incoming: Optional[pd.DataFrame] = None
+            full_refetch_df: Optional[pd.DataFrame] = None
+            refetch_start: Optional[date] = None
+            is_full_fetch = cached_df is None or cached_df.empty or need_head
+
             try:
-                if cached_df is None or cached_df.empty or need_head:
+                if is_full_fetch:
                     incoming = _fetch_fdr_capped(start_dt, target_end)
                     fdr_succeeded = True
-                    if not incoming.empty:
-                        if (
-                            cached_df is not None
-                            and not cached_df.empty
-                            and not has_overlap_price_divergence(
-                                cached_df, incoming, threshold=self.split_divergence_threshold
-                            )
-                        ):
-                            df = self.cache.merge_and_save_ohlcv(mkt, norm_sym, cached_df, incoming)
-                        else:
-                            df = self.cache.save_ohlcv(mkt, norm_sym, incoming)
-                    effective_from = min(start_dt, fetched_from_dt) if fetched_from_dt else start_dt
-                    meta["fetched_from"] = effective_from.strftime("%Y-%m-%d")
                 else:
                     assert last_cached_dt is not None
                     inc_start = max(start_dt, last_cached_dt - timedelta(days=2))
                     incoming = _fetch_fdr_capped(inc_start, target_end)
                     fdr_succeeded = True
-                    if not incoming.empty:
-                        if has_overlap_price_divergence(
-                            cached_df, incoming, threshold=self.split_divergence_threshold
-                        ):
-                            logger.warning(
-                                "Price divergence (possible split/revision) detected for %s (%s); refetching full history",
-                                norm_sym,
-                                mkt,
-                            )
-                            full_start = min(start_dt, first_cached_dt) if first_cached_dt else start_dt
-                            full_df = _fetch_fdr_capped(full_start, target_end)
-                            if not full_df.empty:
-                                df = self.cache.save_ohlcv(mkt, norm_sym, full_df)
-                                meta["fetched_from"] = full_start.strftime("%Y-%m-%d")
-                            else:
-                                df = self.cache.save_ohlcv(mkt, norm_sym, incoming)
-                        else:
-                            df = self.cache.merge_and_save_ohlcv(mkt, norm_sym, cached_df, incoming)
+                    if not incoming.empty and has_overlap_price_divergence(
+                        cached_df, incoming, threshold=self.split_divergence_threshold
+                    ):
+                        logger.warning(
+                            "Price divergence (possible split/revision) detected for %s (%s); refetching full history",
+                            fetch_sym,
+                            mkt,
+                        )
+                        refetch_start = min(start_dt, first_cached_dt) if first_cached_dt else start_dt
+                        full_refetch_df = _fetch_fdr_capped(refetch_start, target_end)
             except Exception as exc:
-                logger.warning("FinanceDataReader failed for %s (%s): %s", norm_sym, mkt, exc)
+                logger.warning("FinanceDataReader failed for %s (%s): %s", fetch_sym, mkt, exc)
 
-            if fdr_succeeded and df is not None and not df.empty:
-                meta["checked_at"] = now_epoch
-                meta["checked_target_date"] = target_end_str
-                self.cache.save_ohlcv_meta(mkt, norm_sym, meta)
-
-            if (df is None or df.empty) and self.kis_client is not None and hasattr(self.kis_client, "get_daily_ohlcv_fallback"):
+            if fdr_succeeded:
                 try:
-                    fallback_df = self.kis_client.get_daily_ohlcv_fallback(norm_sym, market=mkt)
-                    if fallback_df is not None and not fallback_df.empty:
-                        df = self.cache.save_ohlcv(mkt, norm_sym, fallback_df)
-                except Exception as fb_exc:
-                    logger.error("KIS OHLCV fallback also failed for %s: %s", norm_sym, fb_exc)
+                    if is_full_fetch:
+                        if incoming is not None and not incoming.empty:
+                            if (
+                                cached_df is not None
+                                and not cached_df.empty
+                                and not has_overlap_price_divergence(
+                                    cached_df, incoming, threshold=self.split_divergence_threshold
+                                )
+                            ):
+                                df = self.cache.merge_and_save_ohlcv(mkt, fetch_sym, cached_df, incoming)
+                            else:
+                                df = self.cache.save_ohlcv(mkt, fetch_sym, incoming)
+                        effective_from = min(start_dt, fetched_from_dt) if fetched_from_dt else start_dt
+                        meta["fetched_from"] = effective_from.strftime("%Y-%m-%d")
+                    elif full_refetch_df is not None:
+                        if not full_refetch_df.empty:
+                            df = self.cache.save_ohlcv(mkt, fetch_sym, full_refetch_df)
+                            if refetch_start is not None:
+                                meta["fetched_from"] = refetch_start.strftime("%Y-%m-%d")
+                        elif incoming is not None and not incoming.empty:
+                            df = self.cache.save_ohlcv(mkt, fetch_sym, incoming)
+                    elif incoming is not None and not incoming.empty:
+                        df = self.cache.merge_and_save_ohlcv(mkt, fetch_sym, cached_df, incoming)
+
+                    if df is not None and not df.empty:
+                        meta["checked_at"] = now_epoch
+                        meta["checked_target_date"] = target_end_str
+                        self.cache.save_ohlcv_meta(mkt, fetch_sym, meta)
+                except OSError as exc:
+                    logger.warning("OHLCV cache write failed for %s (%s): %s", fetch_sym, mkt, exc)
+                    if full_refetch_df is not None and not full_refetch_df.empty:
+                        df = full_refetch_df
+                    elif incoming is not None and not incoming.empty:
+                        df = normalize_ohlcv(
+                            pd.concat([cached_df, incoming], ignore_index=True)
+                            if (cached_df is not None and not cached_df.empty and not is_full_fetch)
+                            else incoming
+                        )
 
         if df is None or df.empty:
             return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
 
-        # Slice to requested lookback window while keeping full history on disk
-        df = df[df["date"] >= start_dt_str].reset_index(drop=True)
+        # Slice strictly to [start_dt, target_end] while keeping full history on disk
+        df = df[(df["date"] >= start_dt_str) & (df["date"] <= target_end_str)].reset_index(drop=True)
 
         if include_live_quote:
-            should_stitch = as_of is not None or is_market_regular_session_open(mkt, dt=now)
-            if should_stitch:
-                stitch_day = as_of.strftime("%Y-%m-%d") if as_of is not None else market_now(mkt, dt=now).date().strftime("%Y-%m-%d")
-                live_quote = self.get_live_quote(norm_sym, market=mkt)
-                if live_quote and float(live_quote.get("price", 0.0)) > 0:
+            stitch_day = self._resolve_live_stitch_date(df, mkt, as_of=as_of, now=now)
+            if stitch_day is not None:
+                live_quote = self.get_live_quote(fetch_sym, market=mkt)
+                if live_quote:
                     df = self.stitch_live_quote(df, live_quote, today_str=stitch_day)
 
         return df
@@ -436,6 +460,54 @@ class HybridMarketDataProvider:
         if quote:
             self._quote_cache[key] = (now, dict(quote))
         return quote
+
+    @staticmethod
+    def _resolve_live_stitch_date(
+        df: Optional[pd.DataFrame],
+        market: str = "KR",
+        *,
+        as_of: Optional[date] = None,
+        now: Optional[datetime] = None,
+    ) -> Optional[str]:
+        """Return YYYY-MM-DD session date to stitch, or None if live stitching should be skipped."""
+        if as_of is not None:
+            return as_of.strftime("%Y-%m-%d")
+
+        mkt = market.upper()
+        local_today = market_now(mkt, dt=now).date()
+        local_today_str = local_today.strftime("%Y-%m-%d")
+
+        if is_market_regular_session_open(mkt, dt=now):
+            return local_today_str
+
+        # Post-close gap fill: today was a real trading day and regular session has closed,
+        # but cached FDR data doesn't have today's bar yet -> KIS quote has today's closing price.
+        if last_closed_session(mkt, dt=now) == local_today:
+            last_bar_date = str(df["date"].iloc[-1]) if (df is not None and not df.empty) else ""
+            if last_bar_date < local_today_str:
+                return local_today_str
+
+        return None
+
+    def stitch_live_quote_if_applicable(
+        self,
+        df: pd.DataFrame,
+        live_quote: Dict[str, Any],
+        market: str = "KR",
+        *,
+        as_of: Optional[date] = None,
+        now: Optional[datetime] = None,
+    ) -> pd.DataFrame:
+        """
+        Stitch a KIS live quote onto `df` ONLY when it represents a valid session candle.
+        Never adds a fake candle on pre-market, weekends, or market holidays.
+        """
+        if not live_quote or float(live_quote.get("price", 0.0) or 0.0) <= 0:
+            return df
+        stitch_day = self._resolve_live_stitch_date(df, market=market, as_of=as_of, now=now)
+        if stitch_day is None:
+            return df
+        return self.stitch_live_quote(df, live_quote, today_str=stitch_day)
 
     @staticmethod
     def stitch_live_quote(

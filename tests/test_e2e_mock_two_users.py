@@ -51,9 +51,8 @@ def test_two_mock_users_e2e_full_isolation(tmp_path: Path) -> None:
 
     # Bob runs US Infinite Buying on TQQQ
     def fake_us_fdr(sym: str, start: str, end: str) -> pd.DataFrame:
-        today = date.today()
         return pd.DataFrame(
-            [{"date": (today - timedelta(days=1)).strftime("%Y-%m-%d"), "open": 50, "high": 52, "low": 49, "close": 50.0, "volume": 1000}]
+            [{"date": end, "open": 50, "high": 52, "low": 49, "close": 50.0, "volume": 1000}]
         )
 
     provider_b = HybridMarketDataProvider(
