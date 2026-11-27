@@ -322,19 +322,21 @@ def test_split_refetch_failure_preserves_cache_and_retries_cleanly(tmp_path: Pat
     orig_len = len(df0)
     orig_meta = cache.load_ohlcv_meta("US", "SOXL")
 
-    # 1. Refetch raises exception -> cache must remain intact (no mixed 100/50 prices!) and meta unchanged
+    # 1. Refetch raises exception -> return empty DF (never mix pre-split cache + post-split live quote),
+    #    while preserving disk cache & meta untouched
     mode = "fail_exc"
-    df_exc = provider.get_daily_ohlcv("SOXL", market="US", lookback_days=60, as_of=date(2026, 11, 16))
+    df_exc = provider.get_daily_ohlcv("SOXL", market="US", lookback_days=60, as_of=date(2026, 11, 16), include_live_quote=True)
     disk_after_exc = cache.load_ohlcv("US", "SOXL")
+    assert df_exc.empty
     assert len(disk_after_exc) == orig_len
     assert all(float(c) == 100.0 for c in disk_after_exc["close"])
     assert cache.load_ohlcv_meta("US", "SOXL") == orig_meta
-    assert all(float(c) == 100.0 for c in df_exc["close"])
 
-    # 2. Refetch returns empty -> cache must STILL remain intact (not overwritten with 4 incremental rows!)
+    # 2. Refetch returns empty -> return empty DF & preserve disk cache & meta untouched
     mode = "fail_empty"
-    provider.get_daily_ohlcv("SOXL", market="US", lookback_days=60, as_of=date(2026, 11, 16))
+    df_empty = provider.get_daily_ohlcv("SOXL", market="US", lookback_days=60, as_of=date(2026, 11, 16), include_live_quote=True)
     disk_after_empty = cache.load_ohlcv("US", "SOXL")
+    assert df_empty.empty
     assert len(disk_after_empty) == orig_len
     assert all(float(c) == 100.0 for c in disk_after_empty["close"])
     assert cache.load_ohlcv_meta("US", "SOXL") == orig_meta

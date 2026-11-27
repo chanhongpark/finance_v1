@@ -343,6 +343,11 @@ class HybridMarketDataProvider:
             except Exception as exc:
                 logger.warning("FinanceDataReader failed for %s (%s): %s", fetch_sym, mkt, exc)
 
+            if not fdr_succeeded and split_detected:
+                # Never return stale pre-split cache when a split was already detected
+                # (live-quote stitching would mix pre-split history with post-split price).
+                return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
+
             if fdr_succeeded:
                 try:
                     should_update_meta = True
@@ -362,18 +367,18 @@ class HybridMarketDataProvider:
                             meta["fetched_from"] = effective_from.strftime("%Y-%m-%d")
                     elif split_detected:
                         # Only replace cache if full refetch actually returned data; otherwise leave
-                        # existing cache & meta untouched so the next call re-detects and retries.
+                        # existing cache & meta untouched and return empty so callers skip this tick safely.
                         if full_refetch_df is not None and not full_refetch_df.empty:
                             df = self.cache.save_ohlcv(mkt, fetch_sym, full_refetch_df)
                             if refetch_start is not None:
                                 meta["fetched_from"] = refetch_start.strftime("%Y-%m-%d")
                         else:
                             logger.warning(
-                                "Full refetch after split detection returned empty for %s (%s); keeping existing cache",
+                                "Full refetch after split detection returned empty for %s (%s); skipping symbol this run",
                                 fetch_sym,
                                 mkt,
                             )
-                            should_update_meta = False
+                            return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
                     elif incoming is not None and not incoming.empty:
                         df = self.cache.merge_and_save_ohlcv(mkt, fetch_sym, cached_df, incoming)
 
@@ -386,6 +391,8 @@ class HybridMarketDataProvider:
                     if split_detected:
                         if full_refetch_df is not None and not full_refetch_df.empty:
                             df = full_refetch_df
+                        else:
+                            return pd.DataFrame(columns=["date", "open", "high", "low", "close", "volume"])
                     elif incoming is not None and not incoming.empty:
                         df = normalize_ohlcv(
                             pd.concat([cached_df, incoming], ignore_index=True)
