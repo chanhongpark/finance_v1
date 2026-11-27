@@ -12,9 +12,9 @@ from core.execution.order_service import OrderService
 from core.execution.runner import run_daily_reconciliation
 from core.kis.client import MockKISClient
 from core.ledger.calculator import _parse_date, recalculate_lot_from_fills
-from core.ledger.models import Fill, FillSide, Lot, LotStatus, PendingOrderStatus
+from core.ledger.models import Fill, FillSide, Lot, LotStatus, PendingOrder, PendingOrderStatus
 from core.notifier.telegram import TelegramNotifier
-from core.sheets.schema import SHEET_SCHEMAS
+from core.sheets.schema import SCHEMA_VERSION, SHEET_SCHEMAS
 from core.sheets.user_sheet_manager import GSpreadBackend, InMemorySheetBackend, UserSheetManager
 from ui.auth import find_duplicate_sheet_ids
 
@@ -406,3 +406,150 @@ def test_find_duplicate_sheet_ids() -> None:
     }
     dups = find_duplicate_sheet_ids(users)
     assert dups == {"sheet_shared": ["alice", "bob"]}
+
+
+def test_sync_pending_orders_mid_loop_exception_never_duplicates_fills(tmp_path: Path) -> None:
+    """Review #1: Exception on A2 after A1 settles must not duplicate A1's Fill on retry."""
+    ctx = _make_ctx(tmp_path)
+    sheet = UserSheetManager(ctx, backend=InMemorySheetBackend(ctx.sheet_id))
+    sheet.save_user_settings(ctx.settings)
+
+    po1 = PendingOrder("00001", "TQQQ", "US", "us_infinite_buying", "1.0.0", "BUY", req_qty=4, limit_price=50.0, order_date="2026-11-26")
+    po2 = PendingOrder("00002", "SOXL", "US", "us_infinite_buying", "1.0.0", "BUY", req_qty=5, limit_price=30.0, order_date="2026-11-26")
+    sheet.upsert_pending_orders([po1, po2])
+
+    class FlakySecondOrderKIS(MockKISClient):
+        def __init__(self, c: UserContext) -> None:
+            super().__init__(c)
+            self.fail_second = True
+
+        def inquire_ccnl(self, order_no: str = "", market: str = "KR", lookback_days: int = 5) -> List[Dict[str, Any]]:
+            if order_no == "00002" and self.fail_second:
+                raise RuntimeError("500 KIS error on A2")
+            return [
+                {"order_no": "00001", "ord_dt": "2026-11-26", "symbol": "TQQQ", "side": "BUY", "filled_qty": 4, "unfilled_qty": 0, "avg_price": 50.0},
+                {"order_no": "00002", "ord_dt": "2026-11-26", "symbol": "SOXL", "side": "BUY", "filled_qty": 5, "unfilled_qty": 0, "avg_price": 30.0},
+            ]
+
+    kis = FlakySecondOrderKIS(ctx)
+    svc = OrderService(ctx, sheet, kis, notifier=TelegramNotifier(ctx, dry_run=True))
+
+    # First run: A1 succeeds and is persisted immediately; A2 fails
+    svc.sync_pending_orders(markets=("US",))
+    assert svc.last_sync_had_errors is True
+    assert len([f for f in sheet.load_fills(use_cache=False) if f.order_no == "00001"]) == 1
+
+    # Second run: A2 succeeds; A1 must NOT be duplicated
+    kis.fail_second = False
+    svc.sync_pending_orders(markets=("US",))
+    assert svc.last_sync_had_errors is False
+    fills = sheet.load_fills(use_cache=False)
+    assert len([f for f in fills if f.order_no == "00001"]) == 1
+    assert len([f for f in fills if f.order_no == "00002"]) == 1
+
+
+def test_composite_order_key_prevents_daily_order_no_collision(tmp_path: Path) -> None:
+    """Review #2: Same order_no on different dates must not overwrite or cross-match."""
+    ctx = _make_ctx(tmp_path)
+    sheet = UserSheetManager(ctx, backend=InMemorySheetBackend(ctx.sheet_id))
+    sheet.save_user_settings(ctx.settings)
+
+    po_old = PendingOrder("000100", "005930", "KR", "kr_fujimoto_126", "1.0.0", "BUY", req_qty=2, limit_price=70_000, order_date="2026-11-25")
+    po_new = PendingOrder("000100", "000660", "KR", "kr_fujimoto_126", "1.0.0", "BUY", req_qty=3, limit_price=180_000, order_date="2026-11-27")
+    sheet.upsert_pending_orders([po_old, po_new])
+
+    loaded = sheet.load_pending_orders(use_cache=False)
+    assert len(loaded) == 2
+    assert {p.order_key for p in loaded} == {"2026-11-25_000100", "2026-11-27_000100"}
+
+    class SameOrderNoKIS(MockKISClient):
+        def inquire_ccnl(self, order_no: str = "", market: str = "KR", lookback_days: int = 5) -> List[Dict[str, Any]]:
+            # Only 2026-11-27 000660 filled; 2026-11-25 005930 has NOT filled
+            return [
+                {"order_no": "000100", "ord_dt": "2026-11-27", "symbol": "000660", "side": "BUY", "filled_qty": 3, "unfilled_qty": 0, "avg_price": 180_000}
+            ]
+
+    svc = OrderService(ctx, sheet, SameOrderNoKIS(ctx), notifier=TelegramNotifier(ctx, dry_run=True))
+    svc.sync_pending_orders(markets=("KR",))
+
+    lots = sheet.load_lots(use_cache=False)
+    assert len(lots) == 1
+    assert lots[0].symbol == "000660"
+    assert lots[0].qty == 3
+
+
+def test_reconcile_skips_on_sync_error_and_excludes_active_pending_symbols(tmp_path: Path) -> None:
+    """Review #3: Reconciliation must skip on sync errors and exclude symbols with active pending orders."""
+    ctx = _make_ctx(tmp_path)
+    sheet = UserSheetManager(ctx, backend=InMemorySheetBackend(ctx.sheet_id))
+    sheet.save_user_settings(ctx.settings)
+
+    po = PendingOrder("00099", "TQQQ", "US", "us_infinite_buying", "1.0.0", "BUY", req_qty=4, limit_price=50.0, order_date=date.today().strftime("%Y-%m-%d"))
+    sheet.upsert_pending_orders([po])
+
+    class ErrorCcnlKIS(MockKISClient):
+        def inquire_ccnl(self, order_no: str = "", market: str = "KR", lookback_days: int = 5) -> List[Dict[str, Any]]:
+            raise RuntimeError("KIS timeout")
+
+    kis_err = ErrorCcnlKIS(ctx)
+    kis_err.holdings = [{"symbol": "TQQQ", "market": "US", "qty": 4, "avg_price": 50.0}]
+    report_err = run_daily_reconciliation(ctx, sheet, kis_err, markets=("US",))
+    assert report_err.skipped_reason != ""
+    assert len(sheet.load_lots(use_cache=False)) == 0
+
+    # Even when inquire_ccnl succeeds with empty result (still SUBMITTED), TQQQ is excluded from manual lot creation
+    class EmptyCcnlKIS(MockKISClient):
+        def inquire_ccnl(self, order_no: str = "", market: str = "KR", lookback_days: int = 5) -> List[Dict[str, Any]]:
+            return []
+
+    kis_empty = EmptyCcnlKIS(ctx)
+    kis_empty.holdings = [{"symbol": "TQQQ", "market": "US", "qty": 4, "avg_price": 50.0}]
+    report_excl = run_daily_reconciliation(ctx, sheet, kis_empty, markets=("US",))
+    assert report_excl.is_matched
+    assert len(report_excl.created_manual_lots) == 0
+
+
+def test_sync_queues_pending_order_update_when_fill_write_fails(tmp_path: Path) -> None:
+    """Review #4: If append_fills fails during sync, PendingOrders update is also queued (stays SUBMITTED in sheet)."""
+    ctx = _make_ctx(tmp_path)
+    backend = InMemorySheetBackend(ctx.sheet_id)
+    sheet = UserSheetManager(ctx, backend=backend)
+    sheet.save_user_settings(ctx.settings)
+
+    po = PendingOrder("00077", "TQQQ", "US", "us_infinite_buying", "1.0.0", "BUY", req_qty=4, limit_price=50.0, order_date="2026-11-26")
+    sheet.upsert_pending_orders([po])
+
+    class FilledKIS(MockKISClient):
+        def inquire_ccnl(self, order_no: str = "", market: str = "KR", lookback_days: int = 5) -> List[Dict[str, Any]]:
+            return [{"order_no": "00077", "ord_dt": "2026-11-26", "symbol": "TQQQ", "side": "BUY", "filled_qty": 4, "unfilled_qty": 0, "avg_price": 50.0}]
+
+    orig_append = backend.append_rows
+
+    def fail_fills(tab_name: str, rows: List[List[Any]]) -> None:
+        if tab_name == "Fills":
+            raise RuntimeError("429 quota")
+        orig_append(tab_name, rows)
+
+    backend.append_rows = fail_fills  # type: ignore[method-assign]
+    svc = OrderService(ctx, sheet, FilledKIS(ctx), notifier=TelegramNotifier(ctx, dry_run=True))
+    svc.sync_pending_orders(markets=("US",))
+
+    # PendingOrders in sheet must still be SUBMITTED while Fill is in local queue
+    assert sheet.load_pending_orders(use_cache=False)[0].status == PendingOrderStatus.SUBMITTED
+    assert sheet.has_pending_writes()
+
+    # Once backend recovers and flushes, Fills + Lots + PendingOrders(FILLED) all apply in order
+    backend.append_rows = orig_append  # type: ignore[method-assign]
+    assert sheet.flush_pending_writes() == 3
+    assert len(sheet.load_fills(use_cache=False)) == 1
+    assert len(sheet.load_lots(use_cache=False)) == 1
+    assert sheet.load_pending_orders(use_cache=False)[0].status == PendingOrderStatus.FILLED
+
+
+def test_corrupted_pending_queue_is_fail_closed_and_schema_version_bumped(tmp_path: Path) -> None:
+    """Review #6 & #7: Corrupted pending_writes.json returns True (fail-closed) and SCHEMA_VERSION is 1.1.0."""
+    assert SCHEMA_VERSION == "1.1.0"
+    ctx = _make_ctx(tmp_path)
+    sheet = UserSheetManager(ctx, backend=InMemorySheetBackend(ctx.sheet_id))
+    sheet._pending_queue_path.write_text("{corrupted json", encoding="utf-8")
+    assert sheet.has_pending_writes() is True

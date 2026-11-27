@@ -41,16 +41,21 @@ def reconcile_holdings(
     kis_holdings: Sequence[Dict[str, Any]],
     sheet_lots: Sequence[Lot],
     actor: str = "reconciler",
+    exclude_keys: Sequence[tuple[str, str]] = (),
 ) -> ReconciliationReport:
     """
     Compare KIS actual holdings against Sheet OPEN lots grouped by (market, symbol).
+    Symbols in `exclude_keys` (e.g. with unsettled SUBMITTED/PARTIAL pending orders) are skipped.
     """
+    excluded = {(str(m).upper(), str(s).strip().upper()) for m, s in exclude_keys}
     kis_map: Dict[tuple[str, str], Dict[str, Any]] = {}
     for h in kis_holdings:
         qty = int(h.get("qty", 0) or 0)
         if qty <= 0:
             continue
         key = (str(h.get("market", "KR")).upper(), str(h.get("symbol", "")).strip().upper())
+        if key in excluded:
+            continue
         kis_map[key] = {
             "qty": qty,
             "avg_price": float(h.get("avg_price", 0.0) or 0.0),
@@ -60,6 +65,8 @@ def reconcile_holdings(
     for lot in sheet_lots:
         if lot.status == LotStatus.OPEN and lot.qty > 0:
             key = (lot.market.upper(), lot.symbol.upper())
+            if key in excluded:
+                continue
             sheet_qty_map[key] = sheet_qty_map.get(key, 0) + int(lot.qty)
 
     all_keys = sorted(set(kis_map.keys()) | set(sheet_qty_map.keys()))

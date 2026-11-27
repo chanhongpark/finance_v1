@@ -357,8 +357,10 @@ class UserSheetManager:
         try:
             queue = json.loads(self._pending_queue_path.read_text(encoding="utf-8"))
             return bool(queue)
-        except Exception:
-            return False
+        except Exception as exc:
+            # Fail-closed: treat corrupted queue file as pending so reconciliation does not double-count
+            logger.error("Corrupted pending_writes queue at %s (%s); treating as pending", self._pending_queue_path, exc)
+            return True
 
     def flush_pending_writes(self) -> int:
         """Retry queued writes in strict FIFO order (stop on first failure) with Fill deduplication."""
@@ -539,11 +541,25 @@ class UserSheetManager:
         return [Fill.from_sheet_row(r) for r in rows if r.get("fill_id")]
 
     def append_fills(self, fills: List[Fill]) -> bool:
-        """Append-only ledger write (R2.2). Returns True if written immediately, False if queued."""
-        return self._safe_append("Fills", [f.to_sheet_row() for f in fills])
+        """Append-only ledger write with fill_id deduplication (R2.2). Returns True if written, False if queued."""
+        if not fills:
+            return True
+        deduped = list(fills)
+        try:
+            existing_ids = {
+                str(r.get("fill_id", "")).strip()
+                for r in self._backend.read_records("Fills")
+                if r.get("fill_id")
+            }
+            deduped = [f for f in fills if str(f.fill_id).strip() not in existing_ids]
+        except Exception as exc:
+            logger.warning("Could not pre-check existing fill_ids before append (%s); proceeding safely", exc)
+        if not deduped:
+            return True
+        return self._safe_append("Fills", [f.to_sheet_row() for f in deduped])
 
     # ------------------------------------------------------------------
-    # PendingOrders (Upsert by order_no for deferred/partial fill settlement)
+    # PendingOrders (Upsert by composite order_key for deferred/partial fill settlement)
     # ------------------------------------------------------------------
     def load_pending_orders(self, use_cache: bool = True) -> List[PendingOrder]:
         rows = self._read_tab("PendingOrders", use_cache=use_cache)
@@ -554,9 +570,9 @@ class UserSheetManager:
         if not dicts:
             return True
         if queue_only:
-            self._enqueue_failed_write("upsert_rows", "PendingOrders", dicts, key_col="order_no")
+            self._enqueue_failed_write("upsert_rows", "PendingOrders", dicts, key_col="order_key")
             return False
-        return self._safe_upsert("PendingOrders", "order_no", dicts)
+        return self._safe_upsert("PendingOrders", "order_key", dicts)
 
     # ------------------------------------------------------------------
     # Signals & Audit (Append-only)

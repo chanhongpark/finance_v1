@@ -339,7 +339,22 @@ class KISClient:
         self.rate_limiter.acquire()
         now = datetime.now()
         start_str = (now - timedelta(days=max(0, int(lookback_days)))).strftime("%Y%m%d")
-        end_str = (now + timedelta(days=1)).strftime("%Y%m%d")
+        end_str = now.strftime("%Y%m%d")
+
+        def _fmt_ord_dt(raw_dt: Any) -> str:
+            s = str(raw_dt or "").strip()
+            if len(s) == 8 and s.isdigit():
+                return f"{s[:4]}-{s[4:6]}-{s[6:8]}"
+            return s
+
+        def _fmt_side(raw_code: Any) -> str:
+            code = str(raw_code or "").strip()
+            if code == "02":
+                return "BUY"
+            if code == "01":
+                return "SELL"
+            return ""
+
         if market.upper() == "KR":
             tr_id = "VTTC8001R" if self.ctx.is_mock else "TTTC8001R"
             url = f"{self.base_url}/uapi/domestic-stock/v1/trading/inquire-daily-ccld"
@@ -365,14 +380,16 @@ class KISClient:
             return [
                 {
                     "order_no": str(r.get("odno", "")).strip(),
+                    "ord_dt": _fmt_ord_dt(r.get("ord_dt", "")),
                     "symbol": str(r.get("pdno", "")).strip(),
+                    "side": _fmt_side(r.get("sll_buy_dvsn_cd", "")),
                     "filled_qty": int(float(r.get("tot_ccld_qty", 0) or 0)),
                     "unfilled_qty": int(float(r.get("rmn_qty", 0) or 0)),
                     "avg_price": float(r.get("avg_prvs", 0) or 0),
                 }
                 for r in rows
             ]
-        # US overseas stock execution inquiry (wider window covers KST/EST date offset & next-day LOC settlement)
+        # US overseas stock execution inquiry (5-day lookback covers KST/EST offset & next-day LOC settlement)
         tr_id = "VTTS3035R" if self.ctx.is_mock else "TTTS3035R"
         url = f"{self.base_url}/uapi/overseas-stock/v1/trading/inquire-ccnl"
         params = {
@@ -397,7 +414,9 @@ class KISClient:
         return [
             {
                 "order_no": str(r.get("odno", "")).strip(),
+                "ord_dt": _fmt_ord_dt(r.get("ord_dt", "")),
                 "symbol": str(r.get("pdno", "")).strip().upper(),
+                "side": _fmt_side(r.get("sll_buy_dvsn_cd", "")),
                 "filled_qty": int(float(r.get("ft_ccld_qty", 0) or 0)),
                 "unfilled_qty": int(float(r.get("nccs_qty", 0) or 0)),
                 "avg_price": float(r.get("ft_ccld_unpr3", 0) or 0),
@@ -449,7 +468,9 @@ class MockKISClient:
         self.placed_orders.append(record)
         self.confirmed_fills[order_no] = {
             "order_no": order_no,
+            "ord_dt": datetime.now().strftime("%Y-%m-%d"),
             "symbol": symbol,
+            "side": side.upper(),
             "filled_qty": int(qty),
             "unfilled_qty": 0,
             "avg_price": float(price),

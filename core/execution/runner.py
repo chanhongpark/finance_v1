@@ -13,7 +13,7 @@ from core.algorithms import Market, Signal, USInfiniteBuyingAlgorithm, default_r
 from core.context import UserContext
 from core.data.market_data_provider import HybridMarketDataProvider
 from core.execution.order_service import ExecutionOutcome, OrderService
-from core.ledger.models import AuditRecord, LotStatus, utc_now_iso
+from core.ledger.models import AuditRecord, LotStatus, PendingOrderStatus, utc_now_iso
 from core.ledger.reconciler import ReconciliationReport, reconcile_holdings
 from core.notifier.telegram import TelegramNotifier
 from core.risk.risk_manager import RiskManager
@@ -259,11 +259,25 @@ def run_daily_reconciliation(
     order_svc = OrderService(ctx, sheet_manager, kis_client, notifier=notifier)
     order_svc.sync_pending_orders(markets=markets)
 
+    if order_svc.last_sync_had_errors:
+        reason = "미체결 주문 체결 조회/정산 중 오류가 발생하여 이중 계산 방지를 위해 잔고 대사를 보류했습니다."
+        logger.warning("%s (user=%s)", reason, ctx.user_id)
+        if notifier is not None:
+            notifier.send_text(f"⚠️ [잔고 대사 보류]\n{reason}")
+        return ReconciliationReport(ts=utc_now_iso(), is_matched=False, skipped_reason=reason)
+
     # Re-check queue in case settling pending orders queued writes due to quota error
     if sheet_manager.has_pending_writes():
         reason = "체결 정산 중 시트 기록이 대기열에 남아 잔고 대사를 보류했습니다."
         logger.warning("%s (user=%s)", reason, ctx.user_id)
         return ReconciliationReport(ts=utc_now_iso(), is_matched=False, skipped_reason=reason)
+
+    # Exclude symbols that still have active unsettled orders so reconciliation never creates duplicate manual lots
+    active_pending_keys = [
+        (po.market.upper(), po.symbol.upper())
+        for po in sheet_manager.load_pending_orders(use_cache=False)
+        if po.status in {PendingOrderStatus.SUBMITTED, PendingOrderStatus.PARTIAL}
+    ]
 
     kis_holdings: List[Dict[str, Any]] = []
     for mkt in markets:
@@ -273,7 +287,12 @@ def run_daily_reconciliation(
             logger.warning("Failed to inquire %s balance for reconciliation: %s", mkt, exc)
 
     sheet_lots = sheet_manager.load_lots(use_cache=False)
-    report = reconcile_holdings(kis_holdings, sheet_lots, actor=f"reconciler:{ctx.user_id}")
+    report = reconcile_holdings(
+        kis_holdings,
+        sheet_lots,
+        actor=f"reconciler:{ctx.user_id}",
+        exclude_keys=active_pending_keys,
+    )
 
     if report.created_fills:
         fills_written = sheet_manager.append_fills(report.created_fills)

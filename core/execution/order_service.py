@@ -45,6 +45,49 @@ def _order_no_matches(row_order_no: Any, target_order_no: str) -> bool:
     return a == b or (a.lstrip("0") == b.lstrip("0") and a.lstrip("0") != "")
 
 
+def _norm_symbol(sym: Any, market: str) -> str:
+    s = str(sym or "").strip().upper()
+    if market.upper() == "KR" and s.isdigit() and len(s) < 6:
+        return s.zfill(6)
+    return s
+
+
+def _ccnl_row_matches(
+    row: Dict[str, Any],
+    order_no: str,
+    symbol: str,
+    market: str,
+    side: str,
+    order_date: str,
+) -> bool:
+    """Match execution row by composite (order_no, symbol, side, ord_dt) to guard against daily ODNO resets."""
+    if not _order_no_matches(row.get("order_no"), order_no):
+        return False
+    row_sym = str(row.get("symbol", "")).strip()
+    if row_sym and _norm_symbol(row_sym, market) != _norm_symbol(symbol, market):
+        return False
+    row_side = str(row.get("side", "")).strip().upper()
+    if row_side and row_side != side.strip().upper():
+        return False
+    row_dt = parse_date_str(str(row.get("ord_dt", "")))
+    ord_dt = parse_date_str(order_date)
+    if row_dt is not None and ord_dt is not None:
+        max_delta = 1 if market.upper() == "US" else 0
+        if abs((row_dt - ord_dt).days) > max_delta:
+            return False
+    return True
+
+
+def _build_fill_id(order_date: str, order_no: str, cumulative_filled_qty: int, lot_suffix: str = "") -> str:
+    """Deterministic fill_id for broker-confirmed fills so retries and concurrent syncs are idempotent."""
+    clean_no = str(order_no or "").strip()
+    if not clean_no:
+        return generate_id("fill")
+    clean_dt = (order_date or date.today().strftime("%Y-%m-%d")).replace("-", "")
+    base = f"fill_{clean_dt}_{clean_no}_{int(cumulative_filled_qty)}"
+    return f"{base}_{lot_suffix}" if lot_suffix else base
+
+
 def _estimate_fee_and_tax(
     market: str,
     side: FillSide,
@@ -72,11 +115,12 @@ def _estimate_fee_and_tax(
 @dataclass
 class ExecutionOutcome:
     executed: bool
-    decision: str               # EXECUTED | PROPOSED | REJECTED_RISK | ORDER_FAILED | UNFILLED
+    decision: str               # EXECUTED | SUBMITTED | PROPOSED | REJECTED_RISK | ORDER_FAILED | UNFILLED
     message: str
     order_no: str = ""
     filled_qty: int = 0
     lot_ids: List[str] = None
+    fills_written: bool = True
 
     def __post_init__(self) -> None:
         if self.lot_ids is None:
@@ -101,6 +145,7 @@ class OrderService:
         self.kis = kis_client
         self.risk = risk_manager or RiskManager(ctx, sheet_manager.load_user_settings())
         self.notifier = notifier or TelegramNotifier(ctx, dry_run=not ctx.credentials.telegram_bot_token)
+        self.last_sync_had_errors: bool = False
 
     def execute_signal(
         self,
@@ -203,7 +248,17 @@ class OrderService:
                 self._record_signal(signal, "SUBMITTED")
                 self.sheet.append_audit(AuditRecord(now_iso, self.ctx.user_id, "ORDER_SUBMITTED_CCNL_ERROR", msg))
                 return ExecutionOutcome(False, "SUBMITTED", msg, order_no=order_no)
-            matched = [r for r in ccnl_rows if _order_no_matches(r.get("order_no"), order_no)]
+            matched = [
+                r for r in ccnl_rows
+                if _ccnl_row_matches(
+                    r,
+                    order_no=order_no,
+                    symbol=signal.symbol,
+                    market=signal.market.value,
+                    side=signal.action.value,
+                    order_date=today_str,
+                )
+            ]
             if matched:
                 matched_row = matched[0]
                 filled_qty = int(matched_row.get("filled_qty", 0) or 0)
@@ -251,9 +306,10 @@ class OrderService:
             apply_algo_state=True,
             fill_date=today_str,
             record_signal=True,
+            cumulative_filled_qty=filled_qty,
         )
 
-        # If only partially filled right away, track remainder in PendingOrders
+        # If only partially filled right away, track remainder in PendingOrders (ordered with queue if Fill queued)
         if filled_qty < qty:
             self._save_pending_order(
                 signal=signal,
@@ -265,6 +321,7 @@ class OrderService:
                 order_date=today_str,
                 now_iso=now_iso,
                 state_applied=True,
+                queue_only=not outcome.fills_written,
             )
         return outcome
 
@@ -275,7 +332,9 @@ class OrderService:
         """
         Re-query KIS inquire_ccnl for SUBMITTED/PARTIAL orders and settle any newly filled
         quantity into Fills & Lots BEFORE daily reconciliation runs.
+        Persists each order's state immediately after settlement so partial loop failures never duplicate fills.
         """
+        self.last_sync_had_errors = False
         if not hasattr(self.kis, "inquire_ccnl"):
             return []
         if getattr(self.sheet, "is_in_memory", False) and not isinstance(self.kis, MockKISClient):
@@ -294,84 +353,103 @@ class OrderService:
         today_str = today.strftime("%Y-%m-%d")
         now_iso = utc_now_iso()
         outcomes: List[ExecutionOutcome] = []
-        updated_orders: List[PendingOrder] = []
 
         for po in pending:
             try:
                 ccnl_rows = self.kis.inquire_ccnl(order_no=po.order_no, market=po.market)
             except Exception as exc:
+                self.last_sync_had_errors = True
                 self.sheet.append_audit(
-                    AuditRecord(now_iso, self.ctx.user_id, "PENDING_SYNC_ERROR", f"order_no={po.order_no}: {exc}")
+                    AuditRecord(now_iso, self.ctx.user_id, "PENDING_SYNC_ERROR", f"order_key={po.order_key}: {exc}")
                 )
                 continue
 
-            matched = [r for r in ccnl_rows if _order_no_matches(r.get("order_no"), po.order_no)]
-            order_dt = parse_date_str(po.order_date)
-            is_past_order_day = order_dt is not None and order_dt < today
-            is_expired_window = order_dt is not None and (today - order_dt) >= timedelta(days=PENDING_ORDER_EXPIRE_DAYS)
-
-            if matched:
-                row = matched[0]
-                total_filled = int(row.get("filled_qty", 0) or 0)
-                unfilled_qty = int(row.get("unfilled_qty", 0) or 0)
-                avg_price = float(row.get("avg_price", 0) or 0) or float(po.limit_price)
-                delta_qty = total_filled - int(po.recorded_filled_qty)
-
-                if delta_qty > 0:
-                    reconstructed_sig = Signal(
-                        action=SignalAction(po.side),
-                        algo_id=po.algo_id,
-                        algo_version=po.algo_version,
-                        symbol=po.symbol,
-                        market=Market(po.market),
-                        price_type=PriceType.LIMIT,
-                        price=avg_price,
-                        qty=delta_qty,
-                        reason_text=po.reason_text or f"후속 체결 정산 ({po.order_no})",
-                        lot_id=po.lot_id or None,
-                        metadata=dict(po.metadata),
-                    )
-                    state_applied = bool(po.metadata.get("state_applied", False))
-                    outcome = self._apply_confirmed_fill(
-                        signal=reconstructed_sig,
+            try:
+                matched = [
+                    r for r in ccnl_rows
+                    if _ccnl_row_matches(
+                        r,
                         order_no=po.order_no,
-                        filled_qty=delta_qty,
-                        filled_price=avg_price,
-                        matched_row=row,
-                        apply_algo_state=not state_applied,
-                        fill_date=po.order_date or today_str,
-                        record_signal=True,
-                        entry_conditions_override=po.conditions,
+                        symbol=po.symbol,
+                        market=po.market,
+                        side=po.side,
+                        order_date=po.order_date,
                     )
-                    outcomes.append(outcome)
-                    po.recorded_filled_qty = total_filled
-                    if outcome.lot_ids and not po.lot_id:
-                        po.lot_id = outcome.lot_ids[0]
-                    po.metadata["state_applied"] = True
+                ]
+                order_dt = parse_date_str(po.order_date)
+                is_past_order_day = order_dt is not None and order_dt < today
+                is_expired_window = order_dt is not None and (today - order_dt) >= timedelta(days=PENDING_ORDER_EXPIRE_DAYS)
 
-                if po.recorded_filled_qty >= po.req_qty or (unfilled_qty == 0 and po.recorded_filled_qty > 0):
-                    po.status = PendingOrderStatus.FILLED
-                elif unfilled_qty == 0 and po.recorded_filled_qty == 0 and is_past_order_day:
-                    po.status = PendingOrderStatus.EXPIRED
-                elif po.recorded_filled_qty > 0:
-                    po.status = PendingOrderStatus.PARTIAL
-                po.updated_at = now_iso
-                updated_orders.append(po)
-            elif is_expired_window:
-                po.status = PendingOrderStatus.FILLED if po.recorded_filled_qty > 0 else PendingOrderStatus.EXPIRED
-                po.updated_at = now_iso
-                updated_orders.append(po)
+                if matched:
+                    row = matched[0]
+                    total_filled = int(row.get("filled_qty", 0) or 0)
+                    unfilled_qty = int(row.get("unfilled_qty", 0) or 0)
+                    avg_price = float(row.get("avg_price", 0) or 0) or float(po.limit_price)
+                    delta_qty = total_filled - int(po.recorded_filled_qty)
+                    fills_written = True
+
+                    if delta_qty > 0:
+                        reconstructed_sig = Signal(
+                            action=SignalAction(po.side),
+                            algo_id=po.algo_id,
+                            algo_version=po.algo_version,
+                            symbol=po.symbol,
+                            market=Market(po.market),
+                            price_type=PriceType.LIMIT,
+                            price=avg_price,
+                            qty=delta_qty,
+                            reason_text=po.reason_text or f"후속 체결 정산 ({po.order_no})",
+                            lot_id=po.lot_id or None,
+                            metadata=dict(po.metadata),
+                        )
+                        state_applied = bool(po.metadata.get("state_applied", False))
+                        outcome = self._apply_confirmed_fill(
+                            signal=reconstructed_sig,
+                            order_no=po.order_no,
+                            filled_qty=delta_qty,
+                            filled_price=avg_price,
+                            matched_row=row,
+                            apply_algo_state=not state_applied,
+                            fill_date=po.order_date or today_str,
+                            record_signal=True,
+                            entry_conditions_override=po.conditions,
+                            cumulative_filled_qty=total_filled,
+                        )
+                        outcomes.append(outcome)
+                        fills_written = outcome.fills_written
+                        po.recorded_filled_qty = total_filled
+                        if outcome.lot_ids and not po.lot_id:
+                            po.lot_id = outcome.lot_ids[0]
+                        po.metadata["state_applied"] = True
+
+                    if po.recorded_filled_qty >= po.req_qty or (unfilled_qty == 0 and po.recorded_filled_qty > 0):
+                        po.status = PendingOrderStatus.FILLED
+                    elif unfilled_qty == 0 and po.recorded_filled_qty == 0 and is_past_order_day:
+                        po.status = PendingOrderStatus.EXPIRED
+                    elif po.recorded_filled_qty > 0:
+                        po.status = PendingOrderStatus.PARTIAL
+                    po.updated_at = now_iso
+                    # Persist this order's status immediately (queued behind Fills if Fill write was queued)
+                    self.sheet.upsert_pending_orders([po], queue_only=not fills_written)
+                elif is_expired_window:
+                    po.status = PendingOrderStatus.FILLED if po.recorded_filled_qty > 0 else PendingOrderStatus.EXPIRED
+                    po.updated_at = now_iso
+                    self.sheet.upsert_pending_orders([po])
+                    self.sheet.append_audit(
+                        AuditRecord(
+                            now_iso,
+                            self.ctx.user_id,
+                            "PENDING_ORDER_EXPIRED",
+                            f"order_key={po.order_key}, {po.side} {po.symbol} filled={po.recorded_filled_qty}/{po.req_qty}",
+                        )
+                    )
+            except Exception as exc:
+                self.last_sync_had_errors = True
                 self.sheet.append_audit(
-                    AuditRecord(
-                        now_iso,
-                        self.ctx.user_id,
-                        "PENDING_ORDER_EXPIRED",
-                        f"order_no={po.order_no}, {po.side} {po.symbol} filled={po.recorded_filled_qty}/{po.req_qty}",
-                    )
+                    AuditRecord(now_iso, self.ctx.user_id, "PENDING_SETTLE_ERROR", f"order_key={po.order_key}: {exc}")
                 )
+                continue
 
-        if updated_orders:
-            self.sheet.upsert_pending_orders(updated_orders)
         return outcomes
 
     def _save_pending_order(
@@ -385,6 +463,7 @@ class OrderService:
         order_date: str,
         now_iso: str,
         state_applied: bool,
+        queue_only: bool = False,
     ) -> None:
         meta = dict(signal.metadata)
         meta["state_applied"] = state_applied
@@ -407,7 +486,7 @@ class OrderService:
             conditions=signal.conditions_as_dicts(),
             reason_text=signal.reason_text,
         )
-        self.sheet.upsert_pending_orders([po])
+        self.sheet.upsert_pending_orders([po], queue_only=queue_only)
 
     def _apply_confirmed_fill(
         self,
@@ -420,10 +499,13 @@ class OrderService:
         fill_date: str,
         record_signal: bool = True,
         entry_conditions_override: Optional[List[Dict[str, Any]]] = None,
+        cumulative_filled_qty: Optional[int] = None,
     ) -> ExecutionOutcome:
         is_risk_override = bool(signal.metadata.get("risk_override"))
+        cum_qty = int(cumulative_filled_qty if cumulative_filled_qty is not None else filled_qty)
         all_lots = self.sheet.load_lots(use_cache=False)
         all_fills = self.sheet.load_fills(use_cache=False)
+        existing_fill_ids = {f.fill_id for f in all_fills}
         new_fills: List[Fill] = []
         touched_lots: List[Lot] = []
         unallocated_qty = 0
@@ -453,9 +535,21 @@ class OrderService:
             elif apply_algo_state:
                 target_lot.algo_state = self._next_algo_state(target_lot.algo_state, signal)
 
+            det_fill_id = _build_fill_id(fill_date, order_no, cum_qty)
+            if det_fill_id in existing_fill_ids:
+                return ExecutionOutcome(
+                    executed=True,
+                    decision="EXECUTED",
+                    message=f"이미 반영된 체결 건 (fill_id={det_fill_id})",
+                    order_no=order_no,
+                    filled_qty=filled_qty,
+                    lot_ids=[target_lot.lot_id],
+                    fills_written=True,
+                )
+
             fee, tax = _estimate_fee_and_tax(signal.market.value, FillSide.BUY, filled_qty, filled_price, matched_row)
             fill = Fill(
-                fill_id=generate_id("fill"),
+                fill_id=det_fill_id,
                 lot_id=target_lot.lot_id,
                 side=FillSide.BUY,
                 date=fill_date,
@@ -494,12 +588,15 @@ class OrderService:
 
             lot_by_id = {l.lot_id: l for l in all_lots}
             for alloc_lot_id, alloc_qty in allocations:
+                det_fill_id = _build_fill_id(fill_date, order_no, cum_qty, lot_suffix=alloc_lot_id)
+                if det_fill_id in existing_fill_ids:
+                    continue
                 lot_obj = lot_by_id[alloc_lot_id]
                 if apply_algo_state and "next_exit_stage" in signal.metadata:
                     lot_obj.algo_state["exit_stage"] = int(signal.metadata["next_exit_stage"])
                 fee, tax = _estimate_fee_and_tax(signal.market.value, FillSide.SELL, alloc_qty, filled_price, matched_row)
                 fill = Fill(
-                    fill_id=generate_id("fill"),
+                    fill_id=det_fill_id,
                     lot_id=alloc_lot_id,
                     side=FillSide.SELL,
                     date=fill_date,
@@ -514,6 +611,7 @@ class OrderService:
                 synced_lot = apply_fills_to_lot(lot_obj, all_fills + new_fills)
                 touched_lots.append(synced_lot)
 
+        fills_written = True
         if new_fills:
             fills_written = self.sheet.append_fills(new_fills)
             if touched_lots:
@@ -551,6 +649,7 @@ class OrderService:
             order_no=order_no,
             filled_qty=filled_qty,
             lot_ids=[l.lot_id for l in touched_lots],
+            fills_written=fills_written,
         )
 
     @staticmethod

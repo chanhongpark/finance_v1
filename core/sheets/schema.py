@@ -5,7 +5,7 @@ from __future__ import annotations
 
 from typing import Dict, List
 
-SCHEMA_VERSION = "1.0.0"
+SCHEMA_VERSION = "1.1.0"
 
 SHEET_SCHEMAS: Dict[str, List[str]] = {
     "Settings": [
@@ -64,6 +64,7 @@ SHEET_SCHEMAS: Dict[str, List[str]] = {
         "detail",
     ],
     "PendingOrders": [
+        "order_key",
         "order_no",
         "symbol",
         "market",

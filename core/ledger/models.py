@@ -248,8 +248,14 @@ class PendingOrder:
     conditions: List[Dict[str, Any]] = field(default_factory=list)
     reason_text: str = ""
 
+    @property
+    def order_key(self) -> str:
+        """Composite key (order_date + order_no) because KIS order_no resets each business day."""
+        return f"{normalize_date_str(self.order_date)}_{str(self.order_no).strip()}"
+
     def to_sheet_row(self) -> Dict[str, Any]:
         return {
+            "order_key": self.order_key,
             "order_no": str(self.order_no).strip(),
             "symbol": str(self.symbol).strip(),
             "market": str(self.market).strip().upper(),
