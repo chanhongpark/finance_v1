@@ -1,7 +1,7 @@
 """Regression tests for Google Sheets persistence, ledger integrity, and order safety (#1-#12)."""
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, timedelta
 from pathlib import Path
 from typing import Any, Dict, List
 from unittest.mock import MagicMock
@@ -553,3 +553,128 @@ def test_corrupted_pending_queue_is_fail_closed_and_schema_version_bumped(tmp_pa
     sheet = UserSheetManager(ctx, backend=InMemorySheetBackend(ctx.sheet_id))
     sheet._pending_queue_path.write_text("{corrupted json", encoding="utf-8")
     assert sheet.has_pending_writes() is True
+
+
+def test_legacy_pending_orders_without_order_key_backfilled_and_settled(tmp_path: Path) -> None:
+    """Backfill legacy PendingOrders rows missing order_key so they never remain stuck in SUBMITTED."""
+    ctx = _make_ctx(tmp_path)
+    backend = InMemorySheetBackend(ctx.sheet_id)
+    # Simulate sheet created before order_key column existed
+    legacy_headers = [c for c in SHEET_SCHEMAS["PendingOrders"] if c != "order_key"]
+    backend.headers["PendingOrders"] = legacy_headers
+    backend.tables["PendingOrders"] = [
+        {
+            "order_no": "A1",
+            "symbol": "TQQQ",
+            "market": "US",
+            "algo_id": "us_infinite_buying",
+            "algo_version": "1.0.0",
+            "side": "BUY",
+            "req_qty": 4,
+            "recorded_filled_qty": 0,
+            "limit_price": 50.0,
+            "lot_id": "",
+            "status": "SUBMITTED",
+            "order_date": "2026-11-27",
+            "created_at": "2026-11-27T00:00:00Z",
+            "updated_at": "2026-11-27T00:00:00Z",
+            "metadata_json": "{}",
+            "conditions_json": "[]",
+            "reason_text": "legacy",
+        }
+    ]
+
+    sheet = UserSheetManager(ctx, backend=backend)
+    sheet.save_user_settings(ctx.settings)
+
+    # ensure_schema must have backfilled order_key on the existing row
+    raw_rows = backend.read_records("PendingOrders")
+    assert len(raw_rows) == 1
+    assert raw_rows[0]["order_key"] == "2026-11-27_A1"
+
+    class FilledLegacyKIS(MockKISClient):
+        def inquire_ccnl(self, order_no: str = "", market: str = "KR", lookback_days: int = 5) -> List[Dict[str, Any]]:
+            return [{"order_no": "A1", "ord_dt": "2026-11-27", "symbol": "TQQQ", "side": "BUY", "filled_qty": 4, "unfilled_qty": 0, "avg_price": 50.0}]
+
+    svc = OrderService(ctx, sheet, FilledLegacyKIS(ctx), notifier=TelegramNotifier(ctx, dry_run=True))
+    svc.sync_pending_orders(markets=("US",))
+
+    final_rows = backend.read_records("PendingOrders")
+    assert len(final_rows) == 1
+    assert final_rows[0]["order_key"] == "2026-11-27_A1"
+    assert final_rows[0]["status"] == "FILLED"
+
+
+def test_day_order_expires_after_session_close_even_if_kis_reports_unfilled_qty(tmp_path: Path) -> None:
+    """US (order_date + 1 < today) and KR (order_date < today) day orders expire even if unfilled_qty > 0."""
+    ctx = _make_ctx(tmp_path)
+    sheet = UserSheetManager(ctx, backend=InMemorySheetBackend(ctx.sheet_id))
+    sheet.save_user_settings(ctx.settings)
+
+    today = date.today()
+    us_old_date = (today - timedelta(days=2)).strftime("%Y-%m-%d")
+    kr_old_date = (today - timedelta(days=1)).strftime("%Y-%m-%d")
+    po_us = PendingOrder("U1", "TQQQ", "US", "us_infinite_buying", "1.0.0", "BUY", req_qty=4, limit_price=50.0, order_date=us_old_date)
+    po_kr = PendingOrder("K1", "005930", "KR", "kr_fujimoto_126", "1.0.0", "BUY", req_qty=10, recorded_filled_qty=3, limit_price=70_000, order_date=kr_old_date)
+    sheet.upsert_pending_orders([po_us, po_kr])
+
+    class ResidualUnfilledKIS(MockKISClient):
+        def inquire_ccnl(self, order_no: str = "", market: str = "KR", lookback_days: int = 5) -> List[Dict[str, Any]]:
+            if market == "US":
+                return [{"order_no": "U1", "ord_dt": us_old_date, "symbol": "TQQQ", "side": "BUY", "filled_qty": 0, "unfilled_qty": 4, "avg_price": 0.0}]
+            return [{"order_no": "K1", "ord_dt": kr_old_date, "symbol": "005930", "side": "BUY", "filled_qty": 3, "unfilled_qty": 7, "avg_price": 70_000}]
+
+    svc = OrderService(ctx, sheet, ResidualUnfilledKIS(ctx), notifier=TelegramNotifier(ctx, dry_run=True))
+    svc.sync_pending_orders(markets=("US", "KR"))
+
+    by_no = {p.order_no: p for p in sheet.load_pending_orders(use_cache=False)}
+    assert by_no["U1"].status == PendingOrderStatus.EXPIRED
+    assert by_no["K1"].status == PendingOrderStatus.FILLED
+
+
+def test_duplicate_sell_settlement_returns_early_without_extra_notifications(tmp_path: Path) -> None:
+    """Re-applying an already-recorded SELL fill must not emit duplicate Signals/Audits/Telegram alerts."""
+    ctx = _make_ctx(tmp_path)
+    sheet = UserSheetManager(ctx, backend=InMemorySheetBackend(ctx.sheet_id))
+    sheet.save_user_settings(ctx.settings)
+    kis = MockKISClient(ctx)
+    notif = TelegramNotifier(ctx, dry_run=True)
+    svc = OrderService(ctx, sheet, kis, notifier=notif)
+
+    buy_sig = Signal(SignalAction.BUY, "kr_fujimoto_126", "1.0.0", "005930", Market.KR, PriceType.LIMIT, 70_000, qty=5)
+    assert svc.execute_signal(buy_sig, user_confirmed=True).executed
+
+    sell_sig = Signal(SignalAction.SELL, "kr_fujimoto_126", "1.0.0", "005930", Market.KR, PriceType.LIMIT, 75_000, qty=2)
+    out1 = svc._apply_confirmed_fill(sell_sig, "S001", 2, 75_000, None, True, "2026-11-27", True, None, 2)
+    assert out1.executed
+    msg_count = len(notif.sent_messages)
+    sig_count = len(sheet.load_signals(use_cache=False))
+
+    # Re-applying exact same SELL order_no + cumulative qty must return early
+    out2 = svc._apply_confirmed_fill(sell_sig, "S001", 2, 75_000, None, True, "2026-11-27", True, None, 2)
+    assert out2.executed
+    assert len(notif.sent_messages) == msg_count
+    assert len(sheet.load_signals(use_cache=False)) == sig_count
+
+
+def test_load_fills_deduplicates_and_append_fills_reuses_known_ids(tmp_path: Path) -> None:
+    """load_fills deduplicates duplicate fill_ids; append_fills skips extra sheet read when known_fill_ids passed."""
+    ctx = _make_ctx(tmp_path)
+    backend = InMemorySheetBackend(ctx.sheet_id)
+    sheet = UserSheetManager(ctx, backend=backend)
+
+    # Inject duplicate raw rows simulating concurrent append race
+    row_dict = Fill("fill_dup", "lot_1", FillSide.BUY, "2026-11-27", 5, 100.0).to_sheet_row()
+    headers = backend.get_headers("Fills")
+    row_vals = [row_dict.get(c, "") for c in headers]
+    backend.append_rows("Fills", [row_vals, row_vals])
+
+    loaded = sheet.load_fills(use_cache=False)
+    assert len(loaded) == 1
+    assert loaded[0].fill_id == "fill_dup"
+
+    # Passing known_fill_ids avoids calling read_records("Fills")
+    read_spy = MagicMock(side_effect=backend.read_records)
+    backend.read_records = read_spy  # type: ignore[method-assign]
+    sheet.append_fills([Fill("fill_new", "lot_1", FillSide.BUY, "2026-11-27", 2, 105.0)], known_fill_ids={"fill_dup"})
+    read_spy.assert_not_called()

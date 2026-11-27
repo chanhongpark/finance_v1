@@ -16,10 +16,10 @@ import logging
 import time
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from core.context import UserContext, UserSettings
-from core.ledger.models import AuditRecord, Fill, Lot, PendingOrder, SignalRecord, utc_now_iso
+from core.ledger.models import AuditRecord, Fill, Lot, PendingOrder, SignalRecord, normalize_date_str, utc_now_iso
 from core.sheets.schema import SCHEMA_VERSION, SHEET_SCHEMAS, compute_missing_columns
 
 logger = logging.getLogger(__name__)
@@ -315,13 +315,38 @@ class UserSheetManager:
         return isinstance(self._backend, InMemorySheetBackend)
 
     def ensure_schema(self) -> None:
-        """Verify all 6 required tabs and schema_version on startup (R2.1)."""
+        """Verify all required tabs, backfill legacy PendingOrders keys, and update schema_version (R2.1)."""
         for tab_name, headers in SHEET_SCHEMAS.items():
             self._backend.ensure_worksheet(tab_name, headers)
+
+        self._backfill_pending_order_keys()
 
         settings = self.load_raw_settings()
         if settings.get("schema_version") != SCHEMA_VERSION:
             self.save_setting("schema_version", SCHEMA_VERSION)
+
+    def _backfill_pending_order_keys(self) -> None:
+        """One-time self-healing migration: populate blank order_key on legacy PendingOrders rows."""
+        records = self._backend.read_records("PendingOrders")
+        if not records:
+            return
+        needs_migration = any(
+            str(r.get("order_no", "")).strip() and not str(r.get("order_key", "")).strip()
+            for r in records
+        )
+        if not needs_migration:
+            return
+        headers = self._backend.get_headers("PendingOrders") or SHEET_SCHEMAS["PendingOrders"]
+        migrated_rows: List[List[Any]] = []
+        for r in records:
+            row_copy = dict(r)
+            if str(row_copy.get("order_no", "")).strip() and not str(row_copy.get("order_key", "")).strip():
+                ord_dt = normalize_date_str(str(row_copy.get("order_date", "")))
+                ord_no = str(row_copy.get("order_no", "")).strip()
+                row_copy["order_key"] = f"{ord_dt}_{ord_no}"
+            migrated_rows.append([row_copy.get(col, "") for col in headers])
+        self._backend.overwrite_table("PendingOrders", headers, migrated_rows)
+        self.invalidate_cache("PendingOrders")
 
     def invalidate_cache(self, tab_name: Optional[str] = None) -> None:
         if tab_name:
@@ -538,22 +563,34 @@ class UserSheetManager:
 
     def load_fills(self, use_cache: bool = True) -> List[Fill]:
         rows = self._read_tab("Fills", use_cache=use_cache)
-        return [Fill.from_sheet_row(r) for r in rows if r.get("fill_id")]
+        seen: Set[str] = set()
+        result: List[Fill] = []
+        for r in rows:
+            fid = str(r.get("fill_id", "")).strip()
+            if not fid or fid in seen:
+                continue
+            seen.add(fid)
+            result.append(Fill.from_sheet_row(r))
+        return result
 
-    def append_fills(self, fills: List[Fill]) -> bool:
-        """Append-only ledger write with fill_id deduplication (R2.2). Returns True if written, False if queued."""
+    def append_fills(self, fills: List[Fill], known_fill_ids: Optional[Set[str]] = None) -> bool:
+        """Append-only ledger write with fill_id deduplication (R2.2). Reuses known_fill_ids to save reads."""
         if not fills:
             return True
         deduped = list(fills)
-        try:
-            existing_ids = {
-                str(r.get("fill_id", "")).strip()
-                for r in self._backend.read_records("Fills")
-                if r.get("fill_id")
-            }
+        if known_fill_ids is not None:
+            existing_ids = {str(fid).strip() for fid in known_fill_ids if fid}
             deduped = [f for f in fills if str(f.fill_id).strip() not in existing_ids]
-        except Exception as exc:
-            logger.warning("Could not pre-check existing fill_ids before append (%s); proceeding safely", exc)
+        else:
+            try:
+                existing_ids = {
+                    str(r.get("fill_id", "")).strip()
+                    for r in self._backend.read_records("Fills")
+                    if r.get("fill_id")
+                }
+                deduped = [f for f in fills if str(f.fill_id).strip() not in existing_ids]
+            except Exception as exc:
+                logger.warning("Could not pre-check existing fill_ids before append (%s); proceeding safely", exc)
         if not deduped:
             return True
         return self._safe_append("Fills", [f.to_sheet_row() for f in deduped])

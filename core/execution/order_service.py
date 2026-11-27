@@ -377,7 +377,16 @@ class OrderService:
                     )
                 ]
                 order_dt = parse_date_str(po.order_date)
-                is_past_order_day = order_dt is not None and order_dt < today
+                if order_dt is not None:
+                    # Day orders (LOC/limit) do not roll over across sessions;
+                    # US session closes next morning KST, so allow +1 day buffer for US
+                    is_session_closed = (
+                        (order_dt + timedelta(days=1)) < today
+                        if po.market.upper() == "US"
+                        else order_dt < today
+                    )
+                else:
+                    is_session_closed = False
                 is_expired_window = order_dt is not None and (today - order_dt) >= timedelta(days=PENDING_ORDER_EXPIRE_DAYS)
 
                 if matched:
@@ -422,16 +431,18 @@ class OrderService:
                             po.lot_id = outcome.lot_ids[0]
                         po.metadata["state_applied"] = True
 
-                    if po.recorded_filled_qty >= po.req_qty or (unfilled_qty == 0 and po.recorded_filled_qty > 0):
+                    if po.recorded_filled_qty >= po.req_qty:
                         po.status = PendingOrderStatus.FILLED
-                    elif unfilled_qty == 0 and po.recorded_filled_qty == 0 and is_past_order_day:
-                        po.status = PendingOrderStatus.EXPIRED
+                    elif is_session_closed:
+                        po.status = PendingOrderStatus.FILLED if po.recorded_filled_qty > 0 else PendingOrderStatus.EXPIRED
+                    elif unfilled_qty == 0 and po.recorded_filled_qty > 0:
+                        po.status = PendingOrderStatus.FILLED
                     elif po.recorded_filled_qty > 0:
                         po.status = PendingOrderStatus.PARTIAL
                     po.updated_at = now_iso
                     # Persist this order's status immediately (queued behind Fills if Fill write was queued)
                     self.sheet.upsert_pending_orders([po], queue_only=not fills_written)
-                elif is_expired_window:
+                elif is_expired_window or is_session_closed:
                     po.status = PendingOrderStatus.FILLED if po.recorded_filled_qty > 0 else PendingOrderStatus.EXPIRED
                     po.updated_at = now_iso
                     self.sheet.upsert_pending_orders([po])
@@ -611,9 +622,20 @@ class OrderService:
                 synced_lot = apply_fills_to_lot(lot_obj, all_fills + new_fills)
                 touched_lots.append(synced_lot)
 
+            if allocated_qty > 0 and not new_fills:
+                return ExecutionOutcome(
+                    executed=True,
+                    decision="EXECUTED",
+                    message=f"이미 반영된 매도 체결 건 (order_no={order_no})",
+                    order_no=order_no,
+                    filled_qty=filled_qty,
+                    lot_ids=[lid for lid, _ in allocations],
+                    fills_written=True,
+                )
+
         fills_written = True
         if new_fills:
-            fills_written = self.sheet.append_fills(new_fills)
+            fills_written = self.sheet.append_fills(new_fills, known_fill_ids=existing_fill_ids)
             if touched_lots:
                 # Keep Lots strictly ordered behind Fills if append_fills fell back to local queue
                 self.sheet.upsert_lots(touched_lots, queue_only=not fills_written)
