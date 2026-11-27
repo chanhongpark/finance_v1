@@ -678,3 +678,84 @@ def test_load_fills_deduplicates_and_append_fills_reuses_known_ids(tmp_path: Pat
     backend.read_records = read_spy  # type: ignore[method-assign]
     sheet.append_fills([Fill("fill_new", "lot_1", FillSide.BUY, "2026-11-27", 2, 105.0)], known_fill_ids={"fill_dup"})
     read_spy.assert_not_called()
+
+
+def test_sell_resettlement_does_not_double_sell_second_lot(tmp_path: Path) -> None:
+    """Re-running SELL settlement after Lot A closes must NOT allocate a second sell to Lot B."""
+    ctx = _make_ctx(tmp_path)
+    sheet = UserSheetManager(ctx, backend=InMemorySheetBackend(ctx.sheet_id))
+    sheet.save_user_settings(ctx.settings)
+    kis = MockKISClient(ctx)
+    svc = OrderService(ctx, sheet, kis, notifier=TelegramNotifier(ctx, dry_run=True))
+
+    # Create two separate 5-share OPEN lots of 005930 (e.g. two algorithms)
+    b1 = Signal(SignalAction.BUY, "kr_monthly_trend", "1.0.0", "005930", Market.KR, PriceType.LIMIT, 70_000, qty=5)
+    b2 = Signal(SignalAction.BUY, "kr_cup_and_handle", "1.0.0", "005930", Market.KR, PriceType.LIMIT, 71_000, qty=5)
+    assert svc.execute_signal(b1, user_confirmed=True).executed
+    assert svc.execute_signal(b2, user_confirmed=True).executed
+
+    sell_sig = Signal(SignalAction.SELL, "kr_monthly_trend", "1.0.0", "005930", Market.KR, PriceType.LIMIT, 75_000, qty=5)
+    out1 = svc._apply_confirmed_fill(sell_sig, "S1", 5, 75_000, None, True, "2026-11-27", True, None, 5)
+    assert out1.executed
+
+    # Simulate PendingOrders status lost -> re-apply same SELL order S1
+    out2 = svc._apply_confirmed_fill(sell_sig, "S1", 5, 75_000, None, True, "2026-11-27", True, None, 5)
+    assert out2.executed
+    assert out2.decision == "EXECUTED"
+
+    sell_fills = [f for f in sheet.load_fills(use_cache=False) if f.side == FillSide.SELL]
+    assert len(sell_fills) == 1
+    open_qty = sum(l.qty for l in sheet.load_lots(use_cache=False) if l.status == LotStatus.OPEN)
+    assert open_qty == 5  # Second lot remains untouched!
+
+
+def test_backfill_and_load_merge_duplicate_pending_order_keys(tmp_path: Path) -> None:
+    """Duplicate blank-key SUBMITTED + keyed FILLED rows merge into single FILLED row."""
+    ctx = _make_ctx(tmp_path)
+    backend = InMemorySheetBackend(ctx.sheet_id)
+    backend.headers["PendingOrders"] = list(SHEET_SCHEMAS["PendingOrders"])
+    backend.tables["PendingOrders"] = [
+        {"order_key": "", "order_no": "A1", "symbol": "TQQQ", "market": "US", "algo_id": "us_infinite_buying", "algo_version": "1.0.0", "side": "BUY", "req_qty": 4, "recorded_filled_qty": 0, "limit_price": 50.0, "lot_id": "", "status": "SUBMITTED", "order_date": "2026-11-20", "created_at": "2026-11-20T00:00:00Z", "updated_at": "2026-11-20T00:00:00Z", "metadata_json": "{}", "conditions_json": "[]", "reason_text": ""},
+        {"order_key": "2026-11-20_A1", "order_no": "A1", "symbol": "TQQQ", "market": "US", "algo_id": "us_infinite_buying", "algo_version": "1.0.0", "side": "BUY", "req_qty": 4, "recorded_filled_qty": 4, "limit_price": 50.0, "lot_id": "lot_1", "status": "FILLED", "order_date": "2026-11-20", "created_at": "2026-11-20T00:00:00Z", "updated_at": "2026-11-21T00:00:00Z", "metadata_json": "{}", "conditions_json": "[]", "reason_text": ""},
+    ]
+
+    sheet = UserSheetManager(ctx, backend=backend)
+    raw = backend.read_records("PendingOrders")
+    assert len(raw) == 1
+    assert raw[0]["order_key"] == "2026-11-20_A1"
+    assert raw[0]["status"] == "FILLED"
+
+    loaded = sheet.load_pending_orders(use_cache=False)
+    assert len(loaded) == 1
+    assert loaded[0].status == PendingOrderStatus.FILLED
+
+
+def test_unmatched_order_waits_5_days_before_expiring_and_backfill_error_does_not_crash_init(tmp_path: Path) -> None:
+    """Unmatched inquire_ccnl order stays SUBMITTED until 5-day window; backfill error doesn't crash init."""
+    ctx = _make_ctx(tmp_path)
+    backend = InMemorySheetBackend(ctx.sheet_id)
+    orig_read = backend.read_records
+
+    def fail_pending_read_once(tab_name: str) -> List[Dict[str, Any]]:
+        if tab_name == "PendingOrders":
+            backend.read_records = orig_read  # type: ignore[method-assign]
+            raise RuntimeError("429 quota during init backfill")
+        return orig_read(tab_name)
+
+    backend.read_records = fail_pending_read_once  # type: ignore[method-assign]
+    # Must NOT raise during UserSheetManager initialization
+    sheet = UserSheetManager(ctx, backend=backend)
+    sheet.save_user_settings(ctx.settings)
+
+    # Order from 2 days ago not returned by inquire_ccnl -> must NOT expire prematurely (waits 5 days)
+    two_days_ago = (date.today() - timedelta(days=2)).strftime("%Y-%m-%d")
+    po = PendingOrder("M1", "TQQQ", "US", "us_infinite_buying", "1.0.0", "BUY", req_qty=4, limit_price=50.0, order_date=two_days_ago)
+    sheet.upsert_pending_orders([po])
+
+    class EmptyKIS(MockKISClient):
+        def inquire_ccnl(self, order_no: str = "", market: str = "KR", lookback_days: int = 5) -> List[Dict[str, Any]]:
+            return []
+
+    svc = OrderService(ctx, sheet, EmptyKIS(ctx), notifier=TelegramNotifier(ctx, dry_run=True))
+    svc.sync_pending_orders(markets=("US",))
+    assert sheet.load_pending_orders(use_cache=False)[0].status == PendingOrderStatus.SUBMITTED

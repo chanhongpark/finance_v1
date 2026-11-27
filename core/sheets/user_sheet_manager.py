@@ -29,6 +29,30 @@ class SheetQuotaError(RuntimeError):
     """Raised when Google Sheets API returns 429 / quota exceeded."""
 
 
+_PENDING_STATUS_RANK: Dict[str, int] = {
+    "FILLED": 3,
+    "EXPIRED": 3,
+    "PARTIAL": 2,
+    "SUBMITTED": 1,
+}
+
+
+def _pending_row_priority(row: Dict[str, Any]) -> Tuple[int, int, str]:
+    status = str(row.get("status", "")).strip().upper()
+    rank = _PENDING_STATUS_RANK.get(status, 0)
+    try:
+        rec_qty = int(float(row.get("recorded_filled_qty", 0) or 0))
+    except (ValueError, TypeError):
+        rec_qty = 0
+    updated_at = str(row.get("updated_at", "")).strip()
+    return (rank, rec_qty, updated_at)
+
+
+def _pending_order_priority(po: PendingOrder) -> Tuple[int, int, str]:
+    status_val = po.status.value if hasattr(po.status, "value") else str(po.status)
+    return (_PENDING_STATUS_RANK.get(status_val.upper(), 0), int(po.recorded_filled_qty or 0), str(po.updated_at or ""))
+
+
 def _col_letter(col_idx: int) -> str:
     """Convert 1-based column index to A1 column letter (1 -> 'A', 27 -> 'AA')."""
     result = []
@@ -315,36 +339,55 @@ class UserSheetManager:
         return isinstance(self._backend, InMemorySheetBackend)
 
     def ensure_schema(self) -> None:
-        """Verify all required tabs, backfill legacy PendingOrders keys, and update schema_version (R2.1)."""
+        """Verify all required tabs, backfill/dedup PendingOrders keys, and update schema_version (R2.1)."""
         for tab_name, headers in SHEET_SCHEMAS.items():
             self._backend.ensure_worksheet(tab_name, headers)
 
-        self._backfill_pending_order_keys()
+        try:
+            self._backfill_pending_order_keys()
+        except Exception as exc:
+            logger.warning("PendingOrders key backfill skipped due to transient error: %s", exc)
 
         settings = self.load_raw_settings()
         if settings.get("schema_version") != SCHEMA_VERSION:
             self.save_setting("schema_version", SCHEMA_VERSION)
 
     def _backfill_pending_order_keys(self) -> None:
-        """One-time self-healing migration: populate blank order_key on legacy PendingOrders rows."""
+        """Populate blank order_key and merge duplicate order_key rows (keeping most-progressed status)."""
         records = self._backend.read_records("PendingOrders")
         if not records:
             return
-        needs_migration = any(
-            str(r.get("order_no", "")).strip() and not str(r.get("order_key", "")).strip()
-            for r in records
-        )
-        if not needs_migration:
-            return
-        headers = self._backend.get_headers("PendingOrders") or SHEET_SCHEMAS["PendingOrders"]
-        migrated_rows: List[List[Any]] = []
+        needs_blank_fill = False
+        best_by_key: Dict[str, Dict[str, Any]] = {}
+        key_order: List[str] = []
+        valid_count = 0
+
         for r in records:
+            ord_no = str(r.get("order_no", "")).strip()
+            if not ord_no:
+                continue
+            valid_count += 1
             row_copy = dict(r)
-            if str(row_copy.get("order_no", "")).strip() and not str(row_copy.get("order_key", "")).strip():
+            key = str(row_copy.get("order_key", "")).strip()
+            if not key:
+                needs_blank_fill = True
                 ord_dt = normalize_date_str(str(row_copy.get("order_date", "")))
-                ord_no = str(row_copy.get("order_no", "")).strip()
-                row_copy["order_key"] = f"{ord_dt}_{ord_no}"
-            migrated_rows.append([row_copy.get(col, "") for col in headers])
+                key = f"{ord_dt}_{ord_no}"
+                row_copy["order_key"] = key
+
+            if key not in best_by_key:
+                best_by_key[key] = row_copy
+                key_order.append(key)
+            else:
+                if _pending_row_priority(row_copy) >= _pending_row_priority(best_by_key[key]):
+                    best_by_key[key] = row_copy
+
+        has_duplicates = len(best_by_key) < valid_count
+        if not needs_blank_fill and not has_duplicates:
+            return
+
+        headers = self._backend.get_headers("PendingOrders") or SHEET_SCHEMAS["PendingOrders"]
+        migrated_rows = [[best_by_key[k].get(col, "") for col in headers] for k in key_order]
         self._backend.overwrite_table("PendingOrders", headers, migrated_rows)
         self.invalidate_cache("PendingOrders")
 
@@ -600,7 +643,19 @@ class UserSheetManager:
     # ------------------------------------------------------------------
     def load_pending_orders(self, use_cache: bool = True) -> List[PendingOrder]:
         rows = self._read_tab("PendingOrders", use_cache=use_cache)
-        return [PendingOrder.from_sheet_row(r) for r in rows if r.get("order_no")]
+        best_by_key: Dict[str, PendingOrder] = {}
+        key_order: List[str] = []
+        for r in rows:
+            if not r.get("order_no"):
+                continue
+            po = PendingOrder.from_sheet_row(r)
+            key = po.order_key
+            if key not in best_by_key:
+                best_by_key[key] = po
+                key_order.append(key)
+            elif _pending_order_priority(po) >= _pending_order_priority(best_by_key[key]):
+                best_by_key[key] = po
+        return [best_by_key[k] for k in key_order]
 
     def upsert_pending_orders(self, orders: List[PendingOrder], queue_only: bool = False) -> bool:
         dicts = [o.to_sheet_row() for o in orders]

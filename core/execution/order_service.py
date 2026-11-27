@@ -442,7 +442,7 @@ class OrderService:
                     po.updated_at = now_iso
                     # Persist this order's status immediately (queued behind Fills if Fill write was queued)
                     self.sheet.upsert_pending_orders([po], queue_only=not fills_written)
-                elif is_expired_window or is_session_closed:
+                elif is_expired_window:
                     po.status = PendingOrderStatus.FILLED if po.recorded_filled_qty > 0 else PendingOrderStatus.EXPIRED
                     po.updated_at = now_iso
                     self.sheet.upsert_pending_orders([po])
@@ -575,6 +575,24 @@ class OrderService:
             synced_lot = apply_fills_to_lot(target_lot, all_fills + new_fills)
             touched_lots.append(synced_lot)
         else:
+            # Order-level duplicate check BEFORE allocating across lots so a re-run never double-sells a different lot
+            if order_no:
+                order_fill_prefix = _build_fill_id(fill_date, order_no, cum_qty)
+                already_recorded = any(
+                    fid == order_fill_prefix or fid.startswith(f"{order_fill_prefix}_")
+                    for fid in existing_fill_ids
+                )
+                if already_recorded:
+                    return ExecutionOutcome(
+                        executed=True,
+                        decision="EXECUTED",
+                        message=f"이미 반영된 매도 체결 건 (order_no={order_no})",
+                        order_no=order_no,
+                        filled_qty=filled_qty,
+                        lot_ids=[],
+                        fills_written=True,
+                    )
+
             allocations = allocate_sell_across_lots(
                 symbol=signal.symbol,
                 sell_qty=filled_qty,
