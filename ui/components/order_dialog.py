@@ -11,17 +11,27 @@ from __future__ import annotations
 import dataclasses
 import hashlib
 import math
-from typing import Optional
+from typing import Any, Dict, Optional
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
-from core.algorithms.base import PRICE_TYPE_HELP, SUPPORTED_PRICE_TYPES, PriceType, Signal, SignalAction
+from core.algorithms import default_registry
+from core.algorithms.base import (
+    PRICE_TYPE_HELP,
+    SUPPORTED_PRICE_TYPES,
+    Condition,
+    Market,
+    PriceType,
+    Signal,
+    SignalAction,
+)
 from core.execution.order_service import OrderService
 from core.indicators import calculate_technical_indicators, resample_to_monthly
 from core.kis.client import MockKISClient
+from core.ledger.models import Lot, LotMetrics
 from ui.auth import AppServices
 
 CHART_LOOKBACK_DAYS = 200
@@ -323,17 +333,133 @@ def _render_evidence_chart(services: AppServices, signal: Signal, order_price: O
         lot = next((l for l in services.sheet.load_lots() if l.lot_id == signal.lot_id), None)
         if lot is not None:
             avg_price = float(lot.avg_price or 0) or None
+    if avg_price is None:
+        meta_avg = (signal.metadata or {}).get("avg_price")
+        if isinstance(meta_avg, (int, float)) and meta_avg > 0:
+            avg_price = float(meta_avg)
 
     st.plotly_chart(_build_price_chart(df, signal, order_price, avg_price), config={"displayModeBar": False})
 
 
+def build_lot_order_signal(
+    lot: Lot,
+    metrics: LotMetrics,
+    current_price: Optional[float],
+    algo_configs: Dict[str, Dict[str, Any]],
+    global_hard_stop_loss_pct: float = -0.15,
+) -> Signal:
+    """Build an initial order Signal for an OPEN lot from the Dashboard (defaults to SELL full qty)."""
+    market_str = lot.market.upper()
+    market_enum = Market.US if market_str == "US" else Market.KR
+    avg_price = float(metrics.avg_price or lot.avg_price or 0.0)
+    raw_price = float(current_price) if (current_price is not None and current_price > 0) else avg_price
+    ref_price = round_to_tick(raw_price, market_str) if raw_price > 0 else 0.0
+
+    algo_id = lot.algo_id
+    algo = default_registry.get(algo_id)
+    raw_params = algo_configs.get(algo_id, {}).get("params", {})
+    p = algo.merge_params(raw_params) if algo is not None else {}
+    state = lot.algo_state or {}
+    meta: Dict[str, Any] = {}
+    if avg_price > 0:
+        meta["avg_price"] = avg_price
+
+    if avg_price > 0:
+        if algo_id in MONTHLY_TREND_ALGO_IDS:
+            tp_rate = float(p.get("target_profit_rate", 0.20))
+            sl_rate = float(p.get("stop_loss_rate", -0.07))
+            meta["monthly_sma_period"] = int(p.get("monthly_sma_period", 10))
+            meta["target_price"] = round_to_tick(avg_price * (1.0 + tp_rate), market_str)
+            meta["stop_loss_price"] = round_to_tick(avg_price * (1.0 + sl_rate), market_str)
+        elif algo_id in CUP_AND_HANDLE_ALGO_IDS:
+            tp_rate = float(p.get("target_profit_rate", 0.10))
+            sl_rate = float(p.get("stop_loss_rate", -0.05))
+            custom_tp = float(state.get("target_price", 0.0) or 0.0)
+            custom_sl = float(state.get("stop_loss_price", 0.0) or 0.0)
+            meta["target_price"] = custom_tp if custom_tp > 0 else round_to_tick(avg_price * (1.0 + tp_rate), market_str)
+            meta["stop_loss_price"] = custom_sl if custom_sl > 0 else round_to_tick(avg_price * (1.0 + sl_rate), market_str)
+            if state.get("pivot_price"):
+                meta["pivot_price"] = float(state["pivot_price"])
+            if isinstance(state.get("cup_pattern"), dict):
+                meta["cup_pattern"] = state["cup_pattern"]
+        elif algo_id in FUJIMOTO_ALGO_IDS:
+            sl_rate = float(p.get("stop_loss_rate", -0.05))
+            meta["stop_loss_price"] = round_to_tick(avg_price * (1.0 + sl_rate), market_str)
+        elif algo_id == "us_infinite_buying":
+            division = int(state.get("division_count", p.get("division_count", 40)))
+            total_budget = float(state.get("total_budget_usd", p.get("total_budget_usd", 10000.0)))
+            target_roi = float(state.get("target_roi", p.get("target_roi", 0.10)))
+            exhaust_action = str(state.get("exhaust_action", p.get("exhaust_action", "AUTO"))).upper()
+            exhaust_roi = float(state.get("exhaust_target_roi", p.get("exhaust_target_roi", 0.05)))
+            one_round = total_budget / max(1, division)
+            curr_round = float(state["current_round"]) if "current_round" in state else (
+                round((avg_price * metrics.remaining_qty) / one_round, 2) if one_round > 0 else 0.0
+            )
+            eff_roi = exhaust_roi if (curr_round >= division and exhaust_action == "LOWER_TARGET") else target_roi
+            meta["target_price"] = round(avg_price * (1.0 + eff_roi), 2)
+            if global_hard_stop_loss_pct < 0:
+                meta["stop_loss_price"] = round(avg_price * (1.0 + float(global_hard_stop_loss_pct)), 2)
+        elif global_hard_stop_loss_pct < 0:
+            meta["stop_loss_price"] = round_to_tick(avg_price * (1.0 + float(global_hard_stop_loss_pct)), market_str)
+
+    conditions: list[Condition] = []
+    for raw in lot.entry_conditions or []:
+        if isinstance(raw, dict) and {"name", "value", "threshold", "op", "passed", "desc"}.issubset(raw.keys()):
+            conditions.append(
+                Condition(
+                    name=str(raw["name"]),
+                    value=raw["value"],
+                    threshold=raw["threshold"],
+                    op=str(raw["op"]),
+                    passed=bool(raw["passed"]),
+                    desc=str(raw["desc"]),
+                )
+            )
+
+    return Signal(
+        action=SignalAction.SELL,
+        algo_id=lot.algo_id,
+        algo_version=lot.algo_version,
+        symbol=lot.symbol,
+        market=market_enum,
+        price_type=PriceType.LIMIT,
+        price=ref_price,
+        qty=int(metrics.remaining_qty),
+        conditions=conditions,
+        reason_text=f"대시보드 보유 건 직접 주문 (보유 {metrics.remaining_qty:,}주 · 평단 {avg_price:,.2f})",
+        lot_id=lot.lot_id,
+        metadata=meta,
+    )
+
+
 @st.dialog("주문 실행 확인", width="large")
-def open_order_confirmation_dialog(services: AppServices, signal: Signal) -> None:
-    is_buy = signal.action == SignalAction.BUY
+def open_order_confirmation_dialog(
+    services: AppServices,
+    signal: Signal,
+    *,
+    allow_action_switch: bool = False,
+    max_sell_qty: Optional[int] = None,
+) -> None:
     market = signal.market.value
     is_kr = market == "KR"
     k = _signal_key(signal)
     price_fmt = "{:,.0f}" if is_kr else "{:,.2f}"
+
+    action_key = f"action_{k}"
+    if allow_action_switch:
+        action: SignalAction = st.radio(
+            "주문 구분",
+            options=[SignalAction.SELL, SignalAction.BUY],
+            index=0 if signal.action == SignalAction.SELL else 1,
+            format_func=lambda a: "🔴 매도" if a == SignalAction.SELL else "🟢 추가 매수",
+            horizontal=True,
+            key=action_key,
+        )
+    else:
+        action = signal.action
+
+    is_buy = action == SignalAction.BUY
+    active_signal = dataclasses.replace(signal, action=action)
 
     mode_text = "🟢 모의투자" if services.ctx.is_mock else "🔴 실전투자 (실제 자금 체결)"
     symbol_display = services.data_provider.format_symbol_display(signal.symbol, market)
@@ -342,14 +468,17 @@ def open_order_confirmation_dialog(services: AppServices, signal: Signal) -> Non
     st.caption(f"담당 알고리즘 `{signal.algo_id}` (v{signal.algo_version}) · 판단 사유: {signal.reason_text}")
 
     # --- Order type & price ---
-    supported = SUPPORTED_PRICE_TYPES[(market, signal.action.value)]
+    supported = SUPPORTED_PRICE_TYPES[(market, action.value)]
     default_type = signal.price_type if signal.price_type in supported else supported[0]
     base_price = float(signal.price or 0.0)
-    price_key, qty_key, amt_key = f"price_{k}", f"qty_{k}", f"amt_{k}"
+    ptype_key = f"ptype_{k}_{action.value}"
+    price_key = f"price_{k}"
+    qty_key = f"qty_{k}_{action.value}"
+    amt_key = f"amt_{k}_{action.value}"
 
     def _ref_price() -> float:
         """Current unit price from widget state (callbacks run before the script, so never use closures)."""
-        ptype = st.session_state.get(f"ptype_{k}", default_type)
+        ptype = st.session_state.get(ptype_key, default_type)
         if ptype.requires_price:
             p = round_to_tick(float(st.session_state.get(price_key, base_price) or 0.0), market)
             return p if p > 0 else base_price
@@ -370,7 +499,7 @@ def open_order_confirmation_dialog(services: AppServices, signal: Signal) -> Non
         options=supported,
         index=supported.index(default_type),
         format_func=lambda p: p.value,
-        key=f"ptype_{k}",
+        key=ptype_key,
         on_change=_on_qty_change if is_buy else None,
         help="\n".join(f"- **{p.value}**: {PRICE_TYPE_HELP[p]}" for p in supported),
     )
@@ -397,8 +526,9 @@ def open_order_confirmation_dialog(services: AppServices, signal: Signal) -> Non
     ref_price = sent_price if sent_price > 0 else base_price
     if is_buy:
         if qty_key not in st.session_state:
-            st.session_state[qty_key] = int(signal.qty or 0)
-            st.session_state[amt_key] = float(st.session_state[qty_key] * ref_price)
+            default_buy_qty = 1 if (allow_action_switch and signal.action == SignalAction.SELL) else int(signal.qty or 0)
+            st.session_state[qty_key] = default_buy_qty
+            st.session_state[amt_key] = float(default_buy_qty * ref_price)
 
         c_qty, c_amt = st.columns(2)
         c_qty.number_input("주문 수량 (주)", min_value=0, step=1, key=qty_key, on_change=_on_qty_change)
@@ -412,8 +542,24 @@ def open_order_confirmation_dialog(services: AppServices, signal: Signal) -> Non
             help="금액을 입력하면 단가 기준으로 매수 가능한 최대 수량이 자동 계산됩니다.",
         )
         qty = int(st.session_state[qty_key])
-        if int(signal.qty or 0) != qty:
+        if not allow_action_switch and int(signal.qty or 0) != qty:
             st.caption(f"알고리즘 제안 수량: {int(signal.qty or 0):,}주 → 변경: {qty:,}주")
+    elif max_sell_qty is not None:
+        max_q = max(0, int(max_sell_qty))
+        default_sell_qty = min(int(signal.qty or max_q), max_q)
+        c_qty, c_info = st.columns(2)
+        qty = int(
+            c_qty.number_input(
+                "매도 수량 (주)",
+                min_value=0,
+                max_value=max_q,
+                value=default_sell_qty,
+                step=1,
+                key=qty_key,
+                help=f"보유 잔량({max_q:,}주) 범위 내에서 전량 또는 일부 매도 수량을 지정할 수 있습니다.",
+            )
+        )
+        c_info.metric("보유 잔량", f"{max_q:,}주")
     else:
         qty = int(signal.qty or 0)
         st.metric("주문 수량", f"{qty:,}주")
@@ -423,10 +569,10 @@ def open_order_confirmation_dialog(services: AppServices, signal: Signal) -> Non
 
     # --- Evidence chart ---
     st.markdown("##### 📈 주문 근거 차트")
-    _render_evidence_chart(services, signal, sent_price if price_type.requires_price else None)
-    if signal.conditions:
+    _render_evidence_chart(services, active_signal, sent_price if price_type.requires_price else None)
+    if active_signal.conditions:
         with st.expander("판단 조건 상세 ⓘ", expanded=False):
-            for c in signal.conditions:
+            for c in active_signal.conditions:
                 st.write(f"- {c.format_badge()} — {c.desc}")
 
     st.divider()
@@ -442,11 +588,15 @@ def open_order_confirmation_dialog(services: AppServices, signal: Signal) -> Non
         st.rerun()
 
     if c_ok.button("확인 후 주문 실행", type="primary", width="stretch", disabled=qty <= 0 or live_kis_without_sheet):
+        reason = active_signal.reason_text
+        if allow_action_switch:
+            reason = "대시보드 보유종목 직접 매도" if action == SignalAction.SELL else "대시보드 보유종목 직접 추가매수"
         final_signal = dataclasses.replace(
-            signal,
+            active_signal,
             qty=qty,
             price=float(sent_price),
             price_type=price_type,
+            reason_text=reason,
         )
         svc = OrderService(services.ctx, services.sheet, services.kis, notifier=services.notifier)
         outcome = svc.execute_signal(final_signal, user_confirmed=True)
@@ -454,6 +604,6 @@ def open_order_confirmation_dialog(services: AppServices, signal: Signal) -> Non
             st.toast(f"✅ {outcome.message} (주문번호: {outcome.order_no})")
         else:
             st.toast(f"⚠️ [{outcome.decision}] {outcome.message}")
-        for key in (qty_key, amt_key):
+        for key in (qty_key, amt_key, action_key, ptype_key, price_key):
             st.session_state.pop(key, None)
         st.rerun()

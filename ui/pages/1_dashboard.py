@@ -9,6 +9,7 @@ from core.ledger.calculator import calculate_algorithm_performance, recalculate_
 from core.ledger.models import LotStatus
 from ui.auth import AppServices
 from ui.components.lot_editor_dialog import open_lot_editor_dialog
+from ui.components.order_dialog import build_lot_order_signal, open_order_confirmation_dialog
 from ui.components.responsive_cards import compute_lot_guidance, render_lot_card
 
 
@@ -148,11 +149,28 @@ def _render_market_section(
                 global_hard_stop_loss_pct=global_hard_stop_loss_pct,
                 cached_df=cached_df,
             )
+
+            def _open_lot_order(target_lot, target_metrics=metrics, target_price=curr_price) -> None:
+                sig = build_lot_order_signal(
+                    lot=target_lot,
+                    metrics=target_metrics,
+                    current_price=target_price if target_price > 0 else None,
+                    algo_configs=algo_configs,
+                    global_hard_stop_loss_pct=global_hard_stop_loss_pct,
+                )
+                open_order_confirmation_dialog(
+                    services,
+                    sig,
+                    allow_action_switch=True,
+                    max_sell_qty=target_metrics.remaining_qty,
+                )
+
             render_lot_card(
                 lot=lot,
                 metrics=metrics,
                 current_price=curr_price if curr_price > 0 else None,
                 on_map_click=lambda target_lot: open_lot_editor_dialog(services, manual_lot=target_lot),
+                on_order_click=_open_lot_order,
                 symbol_name=services.data_provider.get_symbol_name(lot.symbol, lot.market),
                 guidance_items=guidance,
             )

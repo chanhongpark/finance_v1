@@ -172,6 +172,7 @@ def render_lot_card(
     metrics: LotMetrics,
     current_price: Optional[float] = None,
     on_map_click: Optional[Callable[[Lot], None]] = None,
+    on_order_click: Optional[Callable[[Lot], None]] = None,
     symbol_name: Optional[str] = None,
     guidance_items: Optional[List[str]] = None,
 ) -> None:
@@ -180,13 +181,23 @@ def render_lot_card(
     unrealized_pct = ((eval_price - metrics.avg_price) / metrics.avg_price * 100.0) if metrics.avg_price > 0 else 0.0
 
     with st.container(border=True):
-        top_l, top_r = st.columns([4, 1])
+        show_map = lot.algo_id == "manual" and on_map_click is not None
+        show_order = on_order_click is not None
+        if show_map and show_order:
+            top_l, top_m, top_r = st.columns([3, 1, 1])
+        else:
+            top_l, top_r = st.columns([4, 1])
+            top_m = top_r
+
         algo_badge = "⚠️ 미할당(manual)" if lot.algo_id == "manual" else f"`{lot.algo_id}` v{lot.algo_version}"
         symbol_title = _format_symbol_title(lot.symbol, lot.market, symbol_name)
         top_l.markdown(f"**{symbol_title}** ({lot.market}) · {algo_badge} · 보유 {metrics.holding_days}일")
-        if lot.algo_id == "manual" and on_map_click is not None:
-            if top_r.button("알고리즘 연결", key=f"map_{lot.lot_id}", use_container_width=True):
+        if show_map:
+            if top_m.button("알고리즘 연결", key=f"map_{lot.lot_id}", use_container_width=True):
                 on_map_click(lot)
+        if show_order:
+            if top_r.button("주문 확인", key=f"lot_ord_{lot.lot_id}", type="primary", use_container_width=True):
+                on_order_click(lot)
 
         is_kr = lot.market.upper() == "KR"
         price_fmt = "{:,.0f}" if is_kr else "{:,.2f}"
