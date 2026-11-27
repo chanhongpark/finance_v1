@@ -95,3 +95,67 @@ def test_manual_us_infinite_holding_auto_calculates_t_round_and_generates_orders
     assert len(sells) == 1
     assert sells[0].price == 55.0
     assert len(buys) == 2
+
+
+def test_reconcile_auto_closes_duplicate_manual_lots_and_dedups_load_lots(tmp_path) -> None:
+    from core.context import UserContext, UserCredentials
+    from core.execution.runner import run_daily_reconciliation
+    from core.kis.client import MockKISClient
+    from core.ledger.models import LotStatus
+    from core.sheets.user_sheet_manager import InMemorySheetBackend, UserSheetManager
+
+    ctx = UserContext("u_dup", UserCredentials(is_mock=True), "sheet_dup", base_data_dir=tmp_path / "data")
+    backend = InMemorySheetBackend(ctx.sheet_id)
+    sheet = UserSheetManager(ctx, backend)
+
+    lot1, fill1, _ = register_existing_holding(
+        symbol="018260",
+        market="KR",
+        qty=1,
+        avg_price=239_500.0,
+        algo_id="manual",
+        algo_version="0.0.0",
+        buy_date="2026-11-19",
+    )
+    lot2, fill2, _ = register_existing_holding(
+        symbol="018260",
+        market="KR",
+        qty=1,
+        avg_price=239_500.0,
+        algo_id="manual",
+        algo_version="0.0.0",
+        buy_date="2026-11-19",
+    )
+    sheet.append_fills([fill1, fill2])
+    sheet.upsert_lots([lot1, lot2])
+
+    # Also inject a raw duplicate row with the same lot_id to verify load_lots deduplication
+    backend.append_rows("Lots", [[lot1.to_sheet_row().get(c, "") for c in backend.headers["Lots"]]])
+    sheet.invalidate_cache("Lots")
+    assert len(sheet.load_lots(use_cache=False)) == 2
+
+    # KIS actually holds only 1 share of 018260
+    kis = MockKISClient(ctx)
+    kis.holdings = [{"symbol": "018260", "market": "KR", "qty": 1, "avg_price": 239_500.0}]
+
+    report = run_daily_reconciliation(ctx, sheet, kis, markets=("KR",))
+    assert not report.is_matched
+    assert len(report.closed_duplicate_lots) == 1
+    assert report.closed_duplicate_lots[0].lot_id == lot2.lot_id
+    assert report.closed_duplicate_lots[0].status == LotStatus.CLOSED
+    assert report.closed_duplicate_lots[0].qty == 0
+
+    # After reconciliation, only 1 OPEN lot remains and realized PnL on the closed duplicate is 0
+    all_lots = sheet.load_lots(use_cache=False)
+    all_fills = sheet.load_fills(use_cache=False)
+    open_lots = [l for l in all_lots if l.status == LotStatus.OPEN and l.qty > 0]
+    assert len(open_lots) == 1
+    assert open_lots[0].lot_id == lot1.lot_id
+
+    closed_metrics = recalculate_lot_from_fills(report.closed_duplicate_lots[0], all_fills)
+    assert closed_metrics.remaining_qty == 0
+    assert closed_metrics.realized_pnl == 0.0
+
+    # Re-running reconciliation now matches 100%!
+    report2 = run_daily_reconciliation(ctx, sheet, kis, markets=("KR",))
+    assert report2.is_matched

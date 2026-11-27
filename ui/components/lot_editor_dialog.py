@@ -17,7 +17,7 @@ from typing import Optional
 import streamlit as st
 
 from core.algorithms import Market, default_registry
-from core.ledger.models import Lot
+from core.ledger.models import AuditRecord, Fill, FillSide, Lot, LotStatus, generate_id, utc_now_iso
 from core.ledger.onboarding import (
     assign_algorithm_to_manual_lot,
     build_fujimoto_initial_state,
@@ -178,3 +178,50 @@ def open_lot_editor_dialog(services: AppServices, manual_lot: Optional[Lot] = No
             symbol_display = services.data_provider.format_symbol_display(symbol_val, market_val)
             st.success(f"✅ {symbol_display} ({qty_val}주) 보유 건이 등록되었습니다.")
         st.rerun()
+
+    if is_mapping and manual_lot is not None and manual_lot.algo_id == "manual":
+        st.divider()
+        if st.button(
+            "🗑️ 이 미할당(manual) 보유 건 삭제(중복 정리)",
+            use_container_width=True,
+            help="중복 생성된 미할당 보유 건을 원장에서 청산(CLOSED, 잔량 0주) 처리합니다. 실제 계좌 주문은 발생하지 않습니다.",
+        ):
+            today_str = date.today().strftime("%Y-%m-%d")
+            closed_lot = Lot(
+                lot_id=manual_lot.lot_id,
+                symbol=manual_lot.symbol,
+                market=manual_lot.market,
+                algo_id=manual_lot.algo_id,
+                algo_version=manual_lot.algo_version,
+                buy_date=manual_lot.buy_date,
+                qty=0,
+                avg_price=manual_lot.avg_price,
+                status=LotStatus.CLOSED,
+                params_snapshot=dict(manual_lot.params_snapshot),
+                algo_state=dict(manual_lot.algo_state),
+                entry_conditions=list(manual_lot.entry_conditions),
+                note=f"{manual_lot.note} (사용자 수동 중복 정리)".strip(),
+            )
+            adj_fill = Fill(
+                fill_id=generate_id("fill"),
+                lot_id=manual_lot.lot_id,
+                side=FillSide.SELL,
+                date=max(today_str, manual_lot.buy_date or ""),
+                qty=int(manual_lot.qty),
+                price=float(manual_lot.avg_price),
+                fee=0.0,
+                tax=0.0,
+                order_no="MANUAL_LOT_REMOVE",
+                note="사용자 수동 미할당 보유 건 정리 (손익 0)",
+            )
+            audit = AuditRecord(
+                ts=utc_now_iso(),
+                actor=services.ctx.user_id,
+                action="CLOSE_DUPLICATE_MANUAL_LOT",
+                detail=f"lot_id={manual_lot.lot_id}, symbol={manual_lot.symbol}, qty={manual_lot.qty}",
+            )
+            services.sheet.append_fills([adj_fill])
+            services.sheet.upsert_lots([closed_lot])
+            services.sheet.append_audit(audit)
+            st.toast(f"🗑️ 미할당 보유 건(`{manual_lot.lot_id}`)을 정리했습니다.")
+            st.rerun()

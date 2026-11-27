@@ -586,7 +586,16 @@ class UserSheetManager:
     # ------------------------------------------------------------------
     def load_lots(self, use_cache: bool = True) -> List[Lot]:
         rows = self._read_tab("Lots", use_cache=use_cache)
-        return [Lot.from_sheet_row(r) for r in rows if r.get("lot_id")]
+        by_id: Dict[str, Lot] = {}
+        order: List[str] = []
+        for r in rows:
+            lid = str(r.get("lot_id", "")).strip()
+            if not lid:
+                continue
+            if lid not in by_id:
+                order.append(lid)
+            by_id[lid] = Lot.from_sheet_row(r)
+        return [by_id[lid] for lid in order]
 
     def save_lots(self, lots: List[Lot]) -> None:
         headers = self._backend.get_headers("Lots") or SHEET_SCHEMAS["Lots"]

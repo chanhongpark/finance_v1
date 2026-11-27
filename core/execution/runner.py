@@ -294,12 +294,13 @@ def run_daily_reconciliation(
         exclude_keys=active_pending_keys,
     )
 
+    lots_to_upsert = list(report.created_manual_lots) + list(report.closed_duplicate_lots)
     if report.created_fills:
         fills_written = sheet_manager.append_fills(report.created_fills)
-        if report.created_manual_lots:
-            sheet_manager.upsert_lots(report.created_manual_lots, queue_only=not fills_written)
-    elif report.created_manual_lots:
-        sheet_manager.upsert_lots(report.created_manual_lots)
+        if lots_to_upsert:
+            sheet_manager.upsert_lots(lots_to_upsert, queue_only=not fills_written)
+    elif lots_to_upsert:
+        sheet_manager.upsert_lots(lots_to_upsert)
     for audit in report.audits:
         sheet_manager.append_audit(audit)
 
